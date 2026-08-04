@@ -83,6 +83,11 @@ Release with the installer, updater archive, signature, channel manifest, and
 beta manifest URLs are intentionally separate. The GitHub Release permission
 is protected by the `protected-release` environment.
 
+For a certificate-free development build, use
+`.github/workflows/preview-release.yml`. It publishes a prerelease with an
+unsigned NSIS installer and `checksums.txt` only. It deliberately does not
+enable the updater feature and must not be promoted as a production release.
+
 The optional `updater` Cargo feature is enabled only by that protected
 workflow. Development/PR binaries return a typed “not configured” result from
 Check updates and cannot install an update. Release binaries use the Tauri
