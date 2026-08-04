@@ -146,7 +146,8 @@ jobs:
           $checksumPath = Join-Path $env:GITHUB_WORKSPACE 'dist/updater/checksums.txt'
           $checksumLines = foreach ($assetPath in $assetPaths) {
             $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash *$([IO.Path]::GetFileName($assetPath))"
+            $releaseAssetName = [IO.Path]::GetFileName($assetPath) -replace ' ', '.'
+            "$hash *$releaseAssetName"
           }
           $checksumLines | Set-Content -LiteralPath $checksumPath -Encoding ascii
           $assetPaths += $checksumPath
