@@ -1,0 +1,229 @@
+﻿requirement_id,design_sections,acceptance_tests,implementation_phase,status
+FR-PRO-001,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-002,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-003,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-004,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-005,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-006,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-007,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-008,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-009,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-010,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-EXP-001,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-002,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-003,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-004,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-005,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-006,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-007,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-008,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-009,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-010,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-UP-001,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-002,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-003,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-004,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-005,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-006,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-007,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-008,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-009,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-010,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-DL-001,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-002,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-003,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-004,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-005,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-006,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-007,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-008,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-009,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-OP-001,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-002,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-003,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-004,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-005,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-006,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-007,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-008,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-DEL-001,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-002,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-003,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-004,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-005,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-006,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-PRV-001,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-002,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-003,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-004,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-005,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-006,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-TRN-001,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-002,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-003,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-004,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-005,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-006,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-007,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-008,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-009,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-010,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-SET-001,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-002,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-003,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-004,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-005,51–52,AC-SET-*,Phases 0–4,Complete
+FR-PRO-011,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-012,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-013,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-014,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-015,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-016,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-017,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-018,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-019,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-020,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-PRO-021,"16–18, 42–43, 50, 52",AC-PRO-*,Phase 1,Complete
+FR-EXP-011,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-012,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-013,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-014,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-015,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-016,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-017,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-018,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-019,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-020,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-021,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-022,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-023,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-024,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-025,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-026,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-027,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-EXP-028,"14, 19, 44–45, 50",AC-EXP-*,Phase 1,Complete
+FR-UP-011,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-012,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-013,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-014,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-015,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-016,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-017,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-018,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-019,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-020,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-UP-021,"21–22, 45, 48–52",AC-UP-*,Phases 2–3,Complete
+FR-DL-010,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-011,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-012,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-013,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-014,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-015,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-016,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-017,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-018,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-019,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-020,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-DL-021,"21, 23, 45, 48–52",AC-DL-*,Phases 2–3,Complete
+FR-OP-009,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-010,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-011,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-012,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-013,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-014,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-015,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-016,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-OP-017,"20–21, 48–50",AC-OP-*,Phase 3,Complete
+FR-DEL-007,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-008,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-009,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-010,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-DEL-011,"20, 49–50",AC-DEL-*,Phase 3,Complete
+FR-MET-001,"46, 50",AC-MET-*,Phase 4,Complete
+FR-MET-002,"46, 50",AC-MET-*,Phase 4,Complete
+FR-MET-003,"46, 50",AC-MET-*,Phase 4,Complete
+FR-MET-004,"46, 50",AC-MET-*,Phase 4,Complete
+FR-MET-005,"46, 50",AC-MET-*,Phase 4,Complete
+FR-PRV-007,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-008,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-009,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-010,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-011,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-012,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-013,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-014,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-015,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-016,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-PRV-017,"24, 47, 50–52",AC-PRV-*,Phase 4,Complete
+FR-TRN-011,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-012,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-013,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-014,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-015,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-016,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-017,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-018,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-019,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-020,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-021,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-TRN-022,"21, 48–52",AC-TRN-*,Phases 2–3,Complete
+FR-SET-006,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-007,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-008,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-009,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-010,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-011,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-012,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-013,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-014,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-015,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-016,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-017,51–52,AC-SET-*,Phases 0–4,Complete
+FR-SET-018,51–52,AC-SET-*,Phases 0–4,Complete
+FR-PKG-001,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-002,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-003,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-004,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-005,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-006,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-007,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-008,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-009,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+FR-PKG-010,"31, 34, 53",AC-PKG-*,Phase 4,Complete
+NFR-PERF-001,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-002,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-003,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-004,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-005,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-006,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-PERF-007,"21, 30, 48–49",AC-TRN-003; performance suite,All phases,Complete
+NFR-REL-001,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-REL-002,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-REL-003,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-REL-004,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-REL-005,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-REL-006,"21–23, 48–49, 52",Fault-injection suite,All phases,Complete
+NFR-SEC-001,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-002,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-003,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-004,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-005,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-006,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-007,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-008,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-009,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-SEC-010,"17, 28–29, 45, 47, 50, 53",AC-SEC-*,All phases,Complete
+NFR-UX-001,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-UX-002,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-UX-003,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-UX-004,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-UX-005,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-UX-006,"14, 44, 46–47",AC-EXP-*; AC-MET-*; AC-PRV-*,All phases,Complete
+NFR-COMP-001,"18, 42",AC-PRO-008; provider smoke tests,Phases 1–4,Complete
+NFR-COMP-002,"18, 42",AC-PRO-008; provider smoke tests,Phases 1–4,Complete
+NFR-COMP-003,"18, 42",AC-PRO-008; provider smoke tests,Phases 1–4,Complete
+NFR-COMP-004,"18, 42",AC-PRO-008; provider smoke tests,Phases 1–4,Complete
+NFR-MNT-001,"15, 26, 50, 55",Contract/architecture tests,All phases,Complete
+NFR-MNT-002,"15, 26, 50, 55",Contract/architecture tests,All phases,Complete
+NFR-MNT-003,"15, 26, 50, 55",Contract/architecture tests,All phases,Complete
+NFR-MNT-004,"15, 26, 50, 55",Contract/architecture tests,All phases,Complete
