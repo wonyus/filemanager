@@ -45,12 +45,44 @@ const providerLabels: Record<ProviderType, string> = {
   customS3: "Custom S3",
 };
 
-const navigation = [
-  { label: "Profiles", icon: "◉" },
-  { label: "Explorer", icon: "▦" },
-  { label: "Transfers", icon: "⇄" },
-  { label: "Settings", icon: "⚙" },
+type WorkspaceSection = "profiles" | "explorer" | "transfers" | "settings";
+
+const navigation: {
+  label: string;
+  icon: string;
+  section: WorkspaceSection;
+}[] = [
+  { label: "Profiles", icon: "◉", section: "profiles" },
+  { label: "Explorer", icon: "▦", section: "explorer" },
+  { label: "Transfers", icon: "⇄", section: "transfers" },
+  { label: "Settings", icon: "⚙", section: "settings" },
 ];
+
+const sectionCopy: Record<
+  WorkspaceSection,
+  { title: string; description: string }
+> = {
+  profiles: {
+    title: "Connection profiles",
+    description:
+      "Save S3-compatible endpoints and verify access to your storage accounts.",
+  },
+  explorer: {
+    title: "Object explorer",
+    description:
+      "Browse buckets, preview objects, and manage remote files without leaving this tab.",
+  },
+  transfers: {
+    title: "Transfer queue",
+    description:
+      "Monitor uploads, downloads, copies, and moves with pause, resume, and retry controls.",
+  },
+  settings: {
+    title: "Settings & diagnostics",
+    description:
+      "Tune transfer behavior and inspect redacted diagnostics or application updates.",
+  },
+};
 
 function emptyDraft(): ProfileDraft {
   return {
@@ -235,7 +267,8 @@ function App() {
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
   const profileImportRef = useRef<HTMLInputElement>(null);
   const transferStatusRef = useRef<Record<string, string>>({});
-  const [activeSection, setActiveSection] = useState("profiles");
+  const [activeSection, setActiveSection] =
+    useState<WorkspaceSection>("profiles");
 
   useEffect(() => {
     void bootstrap();
@@ -467,6 +500,7 @@ function App() {
         prefix: profile.rootPrefix,
       });
     }
+    setActiveSection("explorer");
   };
 
   const handleDelete = async (profile: ProfileSummary) => {
@@ -497,14 +531,17 @@ function App() {
     ),
   );
 
-  const navigate = (section: string) => {
+  const navigate = (section: WorkspaceSection) => {
+    // Navigation is intentionally tab-like. Keeping only the selected panel
+    // mounted avoids forcing the user to scroll through the whole workspace.
     setActiveSection(section);
-    document.getElementById(section)?.scrollIntoView({ behavior: "smooth" });
   };
+
+  const activeCopy = sectionCopy[activeSection];
 
   return (
     <main className="min-h-screen bg-canvas text-ink">
-      <div className="mx-auto flex min-h-screen max-w-[1480px] gap-6 px-6 py-6 lg:px-10">
+      <div className="mx-auto flex min-h-screen w-full max-w-[1920px] gap-6 px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
         <aside className="hidden w-64 shrink-0 flex-col rounded-3xl border border-border bg-panel p-4 shadow-soft lg:flex">
           <div className="mb-8 flex items-center gap-3 px-3 py-2">
             <div className="grid size-10 place-items-center rounded-2xl bg-accent text-lg font-bold text-accent-foreground">
@@ -515,19 +552,29 @@ function App() {
               <p className="text-xs text-muted">Desktop workspace</p>
             </div>
           </div>
-          <nav className="space-y-1" aria-label="Primary navigation">
+          <nav
+            className="space-y-1"
+            aria-label="Workspace tabs"
+            role="tablist"
+            aria-orientation="vertical"
+          >
             {navigation.map((item) => {
-              const section = item.label.toLowerCase();
               return (
                 <button
                   className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition ${
-                    activeSection === section
+                    activeSection === item.section
                       ? "bg-accent/10 font-semibold text-accent"
                       : "text-muted hover:bg-black/[.03] hover:text-ink"
                   }`}
                   key={item.label}
                   type="button"
-                  onClick={() => navigate(section)}
+                  onClick={() => navigate(item.section)}
+                  role="tab"
+                  aria-selected={activeSection === item.section}
+                  aria-controls={item.section}
+                  aria-current={
+                    activeSection === item.section ? "page" : undefined
+                  }
                 >
                   <span aria-hidden="true" className="w-5 text-center">
                     {item.icon}
@@ -547,26 +594,54 @@ function App() {
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col gap-6">
+          <nav
+            className="flex gap-2 overflow-x-auto rounded-2xl border border-border bg-panel p-2 shadow-soft lg:hidden"
+            aria-label="Workspace tabs"
+            role="tablist"
+          >
+            {navigation.map((item) => (
+              <button
+                className={`flex shrink-0 items-center gap-2 rounded-xl px-3 py-2 text-sm transition ${
+                  activeSection === item.section
+                    ? "bg-accent/10 font-semibold text-accent"
+                    : "text-muted hover:bg-canvas hover:text-ink"
+                }`}
+                key={item.label}
+                type="button"
+                onClick={() => navigate(item.section)}
+                role="tab"
+                aria-selected={activeSection === item.section}
+                aria-controls={item.section}
+                aria-current={
+                  activeSection === item.section ? "page" : undefined
+                }
+              >
+                <span aria-hidden="true">{item.icon}</span>
+                {item.label}
+              </button>
+            ))}
+          </nav>
           <header className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <p className="mb-1 text-xs font-semibold uppercase tracking-[0.2em] text-accent">
                 Workspace
               </p>
               <h1 className="text-3xl font-semibold tracking-tight">
-                Connection profiles
+                {activeCopy.title}
               </h1>
               <p className="mt-2 max-w-2xl text-sm text-muted">
-                Save S3-compatible endpoints, verify access, and open a bucket
-                in the explorer.
+                {activeCopy.description}
               </p>
             </div>
-            <button
-              className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground shadow-sm transition hover:brightness-95"
-              type="button"
-              onClick={() => openEditor()}
-            >
-              Add profile
-            </button>
+            {activeSection === "profiles" && (
+              <button
+                className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground shadow-sm transition hover:brightness-95"
+                type="button"
+                onClick={() => openEditor()}
+              >
+                Add profile
+              </button>
+            )}
           </header>
 
           {error && (
@@ -600,435 +675,465 @@ function App() {
             />
           </div>
 
-          <section
-            id="profiles"
-            className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
-          >
-            <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h2 className="text-lg font-semibold">Profiles</h2>
-                <p className="mt-1 text-sm text-muted">
-                  Credentials are redacted; connection status is checked on
-                  demand.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  ref={profileImportRef}
-                  className="hidden"
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={importProfiles}
-                />
-                <button
-                  className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas disabled:opacity-50"
-                  type="button"
-                  onClick={() => void exportProfiles()}
-                  disabled={profiles.length === 0 || loading}
-                >
-                  Export profiles
-                </button>
-                <button
-                  className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas"
-                  type="button"
-                  onClick={() => profileImportRef.current?.click()}
-                >
-                  Import profiles
-                </button>
-              </div>
-            </div>
-            {profileNotice && (
-              <p
-                className="mb-4 rounded-xl bg-canvas px-3 py-2 text-xs text-muted"
-                role="status"
-              >
-                {profileNotice}
-              </p>
-            )}
-            {loading && profiles.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border p-10 text-center text-sm text-muted">
-                Loading local state…
-              </div>
-            ) : profiles.length === 0 ? (
-              <EmptyProfiles onAdd={() => openEditor()} />
-            ) : (
-              <div className="grid gap-3">
-                {profiles.map((profile) => (
-                  <ProfileCard
-                    key={profile.id}
-                    profile={profile}
-                    selected={profile.id === selectedProfileId}
-                    busy={saving}
-                    onSelect={() => void chooseProfile(profile)}
-                    onEdit={() => {
-                      if (activeProfile?.id === profile.id)
-                        openEditor(activeProfile);
-                      else
-                        void selectProfile(profile.id).then(() =>
-                          openEditor(
-                            useAppStore.getState().activeProfile ?? undefined,
-                          ),
-                        );
-                    }}
-                    onDuplicate={() => void duplicateProfile(profile.id)}
-                    onDelete={() => void handleDelete(profile)}
-                    onToggleFavorite={() => void toggleFavorite(profile)}
+          {activeSection === "profiles" && (
+            <section
+              id="profiles"
+              role="tabpanel"
+              className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
+            >
+              <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-semibold">Profiles</h2>
+                  <p className="mt-1 text-sm text-muted">
+                    Credentials are redacted; connection status is checked on
+                    demand.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    ref={profileImportRef}
+                    className="hidden"
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={importProfiles}
                   />
-                ))}
+                  <button
+                    className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas disabled:opacity-50"
+                    type="button"
+                    onClick={() => void exportProfiles()}
+                    disabled={profiles.length === 0 || loading}
+                  >
+                    Export profiles
+                  </button>
+                  <button
+                    className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas"
+                    type="button"
+                    onClick={() => profileImportRef.current?.click()}
+                  >
+                    Import profiles
+                  </button>
+                </div>
               </div>
-            )}
-          </section>
+              {profileNotice && (
+                <p
+                  className="mb-4 rounded-xl bg-canvas px-3 py-2 text-xs text-muted"
+                  role="status"
+                >
+                  {profileNotice}
+                </p>
+              )}
+              {loading && profiles.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-border p-10 text-center text-sm text-muted">
+                  Loading local state…
+                </div>
+              ) : profiles.length === 0 ? (
+                <EmptyProfiles onAdd={() => openEditor()} />
+              ) : (
+                <div className="grid gap-3">
+                  {profiles.map((profile) => (
+                    <ProfileCard
+                      key={profile.id}
+                      profile={profile}
+                      selected={profile.id === selectedProfileId}
+                      busy={saving}
+                      onSelect={() => void chooseProfile(profile)}
+                      onEdit={() => {
+                        if (activeProfile?.id === profile.id)
+                          openEditor(activeProfile);
+                        else
+                          void selectProfile(profile.id).then(() =>
+                            openEditor(
+                              useAppStore.getState().activeProfile ?? undefined,
+                            ),
+                          );
+                      }}
+                      onDuplicate={() => void duplicateProfile(profile.id)}
+                      onDelete={() => void handleDelete(profile)}
+                      onToggleFavorite={() => void toggleFavorite(profile)}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
 
-          <ExplorerPanel
-            profile={selectedSummary}
-            activeProfile={activeProfile}
-            buckets={buckets}
-            listing={listing}
-            location={location}
-            loading={loading}
-            listingError={listingError}
-            bucketError={bucketError}
-            onLoadBuckets={() =>
-              selectedSummary && void listBuckets(selectedSummary.id)
-            }
-            onOpenBucket={(bucket) => {
-              if (selectedSummary) {
-                void openExplorer({
-                  profileId: selectedSummary.id,
-                  bucket,
-                  prefix: activeProfile?.rootPrefix ?? "",
-                });
-              }
-            }}
-            onOpenPrefix={(prefix) => {
-              if (location) void openExplorer({ ...location, prefix });
-            }}
-            onOpenLocation={(nextLocation) => {
-              if (selectedProfileId !== nextLocation.profileId) {
-                void selectProfile(nextLocation.profileId).then(() =>
-                  openExplorer(nextLocation),
-                );
-              } else {
-                void openExplorer(nextLocation);
-              }
-            }}
-            onRefresh={() => {
-              if (location) void listEntries(location);
-            }}
-            onClearListingError={clearListingError}
-            onClearBucketError={clearBucketError}
-            onSelectEntry={(entry) => {
-              if (!location) return;
-              void loadMetadata({
-                schemaVersion: 1,
-                profileId: location.profileId,
-                bucket: location.bucket,
-                key: entry.key,
-              });
-            }}
-            onDownloadSelection={async (entries) => {
-              if (!location || entries.length === 0) return;
-              try {
-                const destination =
-                  entries.length === 1 && entries[0].kind === "file"
-                    ? hasNativeTauriRuntime()
-                      ? await commands.pickSaveFile(entries[0].displayName)
-                      : window.prompt(
-                          "Download destination path",
-                          entries[0].displayName,
-                        )
-                    : hasNativeTauriRuntime()
-                      ? await commands.pickDirectory()
-                      : window.prompt("Download destination folder");
-                if (!destination?.trim()) return;
-                const destinationPath =
-                  entries.length > 1 ||
-                  entries.some((entry) => entry.kind !== "file")
-                    ? destination.trim().endsWith("/") ||
-                      destination.trim().endsWith("\\")
-                      ? destination.trim()
-                      : `${destination.trim()}\\`
-                    : destination.trim();
-                for (const entry of entries) {
-                  void startTransfer({
-                    schemaVersion: 1,
-                    operation:
-                      entry.kind === "file" ? "downloadFile" : "downloadPrefix",
-                    profileId: location.profileId,
-                    source: {
-                      kind: "remote",
-                      profileId: location.profileId,
-                      bucket: location.bucket,
-                      key: entry.key,
-                    },
-                    destination: { kind: "local", path: destinationPath },
-                    collisionPolicy: "ask",
-                    recursive: entry.kind !== "file",
-                  });
-                }
-              } catch (error) {
-                window.alert(formatCommandError(error));
-              }
-            }}
-            onShareEntry={(entry) => {
-              if (!location) return;
-              const request = {
-                schemaVersion: 1,
-                profileId: location.profileId,
-                bucket: location.bucket,
-                key: entry.key,
-              };
-              void loadMetadata(request).then((nextMetadata) => {
-                if (nextMetadata?.shareSupported) {
-                  void createShare(request);
-                }
-              });
-            }}
-            onOpenFile={async (entry) => {
-              if (!location) return;
-              const request = {
-                schemaVersion: 1,
-                profileId: location.profileId,
-                bucket: location.bucket,
-                key: entry.key,
-              };
-              const nextMetadata = await loadMetadata(request);
-              if (nextMetadata?.previewSupported) {
-                await loadPreview(request);
-              }
-            }}
-            onDeleteSelection={(entries) => {
-              if (!location) return;
-              const allFiles = entries.every((entry) => entry.kind === "file");
-              if (allFiles && entries.length > 1) {
-                const knownBytes = entries.reduce(
-                  (total, entry) => total + (entry.size ?? 0),
-                  0,
-                );
-                const requiresTyped =
-                  entries.length > 100 || knownBytes > 10 * 1024 * 1024 * 1024;
-                const confirmation = requiresTyped
-                  ? window.prompt(
-                      `This will delete ${entries.length} selected objects (${formatBytes(knownBytes)} known). Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE ${entries.length} OBJECTS to continue.`,
-                    )
-                  : window.prompt(
-                      `Delete ${entries.length} selected objects? Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE to continue.`,
-                    );
-                if (
-                  confirmation !==
-                  (requiresTyped
-                    ? `DELETE ${entries.length} OBJECTS`
-                    : "DELETE")
-                )
-                  return;
-                void startTransfer({
-                  schemaVersion: 1,
-                  operation: "deleteObjects",
-                  profileId: location.profileId,
-                  source: {
-                    kind: "remote",
-                    profileId: location.profileId,
-                    bucket: location.bucket,
-                    key: entries[0].key,
-                  },
-                  deleteKeys: entries.map((entry) => entry.key),
-                  confirmation,
-                  totalBytes: knownBytes || undefined,
-                  totalItems: entries.length,
-                  recursive: false,
-                });
-                return;
-              }
-              for (const entry of entries) {
-                const confirmation =
-                  entry.kind !== "file"
-                    ? window.prompt(
-                        `Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE ${entry.key.replace(/\/+$/, "")} to delete this prefix.`,
-                      )
-                    : window.prompt(
-                        "Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE to continue.",
+          {activeSection === "explorer" && (
+            <>
+              <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
+                <div className="min-w-0">
+                  <ExplorerPanel
+                    profile={selectedSummary}
+                    activeProfile={activeProfile}
+                    buckets={buckets}
+                    listing={listing}
+                    location={location}
+                    loading={loading}
+                    listingError={listingError}
+                    bucketError={bucketError}
+                    onLoadBuckets={() =>
+                      selectedSummary && void listBuckets(selectedSummary.id)
+                    }
+                    onOpenBucket={(bucket) => {
+                      if (selectedSummary) {
+                        void openExplorer({
+                          profileId: selectedSummary.id,
+                          bucket,
+                          prefix: activeProfile?.rootPrefix ?? "",
+                        });
+                      }
+                    }}
+                    onOpenPrefix={(prefix) => {
+                      if (location) void openExplorer({ ...location, prefix });
+                    }}
+                    onOpenLocation={(nextLocation) => {
+                      if (selectedProfileId !== nextLocation.profileId) {
+                        void selectProfile(nextLocation.profileId).then(() =>
+                          openExplorer(nextLocation),
+                        );
+                      } else {
+                        void openExplorer(nextLocation);
+                      }
+                    }}
+                    onRefresh={() => {
+                      if (location) void listEntries(location);
+                    }}
+                    onClearListingError={clearListingError}
+                    onClearBucketError={clearBucketError}
+                    onSelectEntry={(entry) => {
+                      if (!location) return;
+                      void loadMetadata({
+                        schemaVersion: 1,
+                        profileId: location.profileId,
+                        bucket: location.bucket,
+                        key: entry.key,
+                      });
+                    }}
+                    onDownloadSelection={async (entries) => {
+                      if (!location || entries.length === 0) return;
+                      try {
+                        const destination =
+                          entries.length === 1 && entries[0].kind === "file"
+                            ? hasNativeTauriRuntime()
+                              ? await commands.pickSaveFile(
+                                  entries[0].displayName,
+                                )
+                              : window.prompt(
+                                  "Download destination path",
+                                  entries[0].displayName,
+                                )
+                            : hasNativeTauriRuntime()
+                              ? await commands.pickDirectory()
+                              : window.prompt("Download destination folder");
+                        if (!destination?.trim()) return;
+                        const destinationPath =
+                          entries.length > 1 ||
+                          entries.some((entry) => entry.kind !== "file")
+                            ? destination.trim().endsWith("/") ||
+                              destination.trim().endsWith("\\")
+                              ? destination.trim()
+                              : `${destination.trim()}\\`
+                            : destination.trim();
+                        for (const entry of entries) {
+                          void startTransfer({
+                            schemaVersion: 1,
+                            operation:
+                              entry.kind === "file"
+                                ? "downloadFile"
+                                : "downloadPrefix",
+                            profileId: location.profileId,
+                            source: {
+                              kind: "remote",
+                              profileId: location.profileId,
+                              bucket: location.bucket,
+                              key: entry.key,
+                            },
+                            destination: {
+                              kind: "local",
+                              path: destinationPath,
+                            },
+                            collisionPolicy: "ask",
+                            recursive: entry.kind !== "file",
+                          });
+                        }
+                      } catch (error) {
+                        window.alert(formatCommandError(error));
+                      }
+                    }}
+                    onShareEntry={(entry) => {
+                      if (!location) return;
+                      const request = {
+                        schemaVersion: 1,
+                        profileId: location.profileId,
+                        bucket: location.bucket,
+                        key: entry.key,
+                      };
+                      void loadMetadata(request).then((nextMetadata) => {
+                        if (nextMetadata?.shareSupported) {
+                          void createShare(request);
+                        }
+                      });
+                    }}
+                    onOpenFile={async (entry) => {
+                      if (!location) return;
+                      const request = {
+                        schemaVersion: 1,
+                        profileId: location.profileId,
+                        bucket: location.bucket,
+                        key: entry.key,
+                      };
+                      const nextMetadata = await loadMetadata(request);
+                      if (nextMetadata?.previewSupported) {
+                        await loadPreview(request);
+                      }
+                    }}
+                    onDeleteSelection={(entries) => {
+                      if (!location) return;
+                      const allFiles = entries.every(
+                        (entry) => entry.kind === "file",
                       );
-                if (!confirmation) continue;
-                void startTransfer({
-                  schemaVersion: 1,
-                  operation: "deleteObjects",
-                  profileId: location.profileId,
-                  source: {
-                    kind: "remote",
-                    profileId: location.profileId,
-                    bucket: location.bucket,
-                    key: entry.key,
-                  },
-                  confirmation,
-                  recursive: entry.kind !== "file",
-                });
-              }
-            }}
-            onPasteSelection={(
-              entries,
-              mode,
-              sourceLocation,
-              destinationPrefix,
-            ) => {
-              if (!location || entries.length === 0) return;
-              if (sourceLocation.profileId !== location.profileId) {
-                window.alert(
-                  "Remote copy and move between different profiles are not supported in MVP.",
-                );
-                return;
-              }
-              const targetPrefixRaw = destinationPrefix ?? location.prefix;
-              const targetPrefix = targetPrefixRaw
-                ? targetPrefixRaw.endsWith("/")
-                  ? targetPrefixRaw
-                  : `${targetPrefixRaw}/`
-                : "";
-              for (const entry of entries) {
-                const sourceName = entry.key
-                  .replace(/\/+$/, "")
-                  .split("/")
-                  .pop();
-                if (!sourceName) continue;
-                const isFolder = entry.kind !== "file";
-                void startTransfer({
-                  schemaVersion: 1,
-                  operation:
-                    mode === "copy"
-                      ? isFolder
-                        ? "copyPrefix"
-                        : "copyObject"
-                      : isFolder
-                        ? "movePrefix"
-                        : "moveObject",
-                  profileId: location.profileId,
-                  source: {
-                    kind: "remote",
-                    profileId: sourceLocation.profileId,
-                    bucket: sourceLocation.bucket,
-                    key: entry.key,
-                  },
-                  destination: {
-                    kind: "remote",
-                    profileId: location.profileId,
-                    bucket: location.bucket,
-                    key: `${targetPrefix}${sourceName}${isFolder ? "/" : ""}`,
-                  },
-                  collisionPolicy: "ask",
-                  recursive: isFolder,
-                });
-              }
-            }}
-            onCreateFolder={(name) => {
-              if (!location) return;
-              const cleanName = name.replace(/[\\/]/g, "").trim();
-              if (!cleanName) return;
-              void startTransfer({
-                schemaVersion: 1,
-                operation: "createFolder",
-                profileId: location.profileId,
-                source: {
-                  kind: "remote",
-                  profileId: location.profileId,
-                  bucket: location.bucket,
-                  key: `${location.prefix}${cleanName}/`,
-                },
-                collisionPolicy: "fail",
-              });
-            }}
-            onRenameEntry={(entry, nextName) => {
-              if (!location) return;
-              const cleanName = nextName.replace(/[\\/]/g, "").trim();
-              if (!cleanName) return;
-              const folder = entry.kind !== "file";
-              void startTransfer({
-                schemaVersion: 1,
-                operation: folder ? "movePrefix" : "moveObject",
-                profileId: location.profileId,
-                source: {
-                  kind: "remote",
-                  profileId: location.profileId,
-                  bucket: location.bucket,
-                  key: entry.key,
-                },
-                destination: {
-                  kind: "remote",
-                  profileId: location.profileId,
-                  bucket: location.bucket,
-                  key: `${location.prefix}${cleanName}${folder ? "/" : ""}`,
-                },
-                collisionPolicy: "ask",
-              });
-            }}
-            onNextPage={() => {
-              if (location && listing?.nextToken)
-                void listEntries(location, listing.nextToken);
-            }}
-          />
+                      if (allFiles && entries.length > 1) {
+                        const knownBytes = entries.reduce(
+                          (total, entry) => total + (entry.size ?? 0),
+                          0,
+                        );
+                        const requiresTyped =
+                          entries.length > 100 ||
+                          knownBytes > 10 * 1024 * 1024 * 1024;
+                        const confirmation = requiresTyped
+                          ? window.prompt(
+                              `This will delete ${entries.length} selected objects (${formatBytes(knownBytes)} known). Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE ${entries.length} OBJECTS to continue.`,
+                            )
+                          : window.prompt(
+                              `Delete ${entries.length} selected objects? Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE to continue.`,
+                            );
+                        if (
+                          confirmation !==
+                          (requiresTyped
+                            ? `DELETE ${entries.length} OBJECTS`
+                            : "DELETE")
+                        )
+                          return;
+                        void startTransfer({
+                          schemaVersion: 1,
+                          operation: "deleteObjects",
+                          profileId: location.profileId,
+                          source: {
+                            kind: "remote",
+                            profileId: location.profileId,
+                            bucket: location.bucket,
+                            key: entries[0].key,
+                          },
+                          deleteKeys: entries.map((entry) => entry.key),
+                          confirmation,
+                          totalBytes: knownBytes || undefined,
+                          totalItems: entries.length,
+                          recursive: false,
+                        });
+                        return;
+                      }
+                      for (const entry of entries) {
+                        const confirmation =
+                          entry.kind !== "file"
+                            ? window.prompt(
+                                `Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE ${entry.key.replace(/\/+$/, "")} to delete this prefix.`,
+                              )
+                            : window.prompt(
+                                "Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE to continue.",
+                              );
+                        if (!confirmation) continue;
+                        void startTransfer({
+                          schemaVersion: 1,
+                          operation: "deleteObjects",
+                          profileId: location.profileId,
+                          source: {
+                            kind: "remote",
+                            profileId: location.profileId,
+                            bucket: location.bucket,
+                            key: entry.key,
+                          },
+                          confirmation,
+                          recursive: entry.kind !== "file",
+                        });
+                      }
+                    }}
+                    onPasteSelection={(
+                      entries,
+                      mode,
+                      sourceLocation,
+                      destinationPrefix,
+                    ) => {
+                      if (!location || entries.length === 0) return;
+                      if (sourceLocation.profileId !== location.profileId) {
+                        window.alert(
+                          "Remote copy and move between different profiles are not supported in MVP.",
+                        );
+                        return;
+                      }
+                      const targetPrefixRaw =
+                        destinationPrefix ?? location.prefix;
+                      const targetPrefix = targetPrefixRaw
+                        ? targetPrefixRaw.endsWith("/")
+                          ? targetPrefixRaw
+                          : `${targetPrefixRaw}/`
+                        : "";
+                      for (const entry of entries) {
+                        const sourceName = entry.key
+                          .replace(/\/+$/, "")
+                          .split("/")
+                          .pop();
+                        if (!sourceName) continue;
+                        const isFolder = entry.kind !== "file";
+                        void startTransfer({
+                          schemaVersion: 1,
+                          operation:
+                            mode === "copy"
+                              ? isFolder
+                                ? "copyPrefix"
+                                : "copyObject"
+                              : isFolder
+                                ? "movePrefix"
+                                : "moveObject",
+                          profileId: location.profileId,
+                          source: {
+                            kind: "remote",
+                            profileId: sourceLocation.profileId,
+                            bucket: sourceLocation.bucket,
+                            key: entry.key,
+                          },
+                          destination: {
+                            kind: "remote",
+                            profileId: location.profileId,
+                            bucket: location.bucket,
+                            key: `${targetPrefix}${sourceName}${isFolder ? "/" : ""}`,
+                          },
+                          collisionPolicy: "ask",
+                          recursive: isFolder,
+                        });
+                      }
+                    }}
+                    onCreateFolder={(name) => {
+                      if (!location) return;
+                      const cleanName = name.replace(/[\\/]/g, "").trim();
+                      if (!cleanName) return;
+                      void startTransfer({
+                        schemaVersion: 1,
+                        operation: "createFolder",
+                        profileId: location.profileId,
+                        source: {
+                          kind: "remote",
+                          profileId: location.profileId,
+                          bucket: location.bucket,
+                          key: `${location.prefix}${cleanName}/`,
+                        },
+                        collisionPolicy: "fail",
+                      });
+                    }}
+                    onRenameEntry={(entry, nextName) => {
+                      if (!location) return;
+                      const cleanName = nextName.replace(/[\\/]/g, "").trim();
+                      if (!cleanName) return;
+                      const folder = entry.kind !== "file";
+                      void startTransfer({
+                        schemaVersion: 1,
+                        operation: folder ? "movePrefix" : "moveObject",
+                        profileId: location.profileId,
+                        source: {
+                          kind: "remote",
+                          profileId: location.profileId,
+                          bucket: location.bucket,
+                          key: entry.key,
+                        },
+                        destination: {
+                          kind: "remote",
+                          profileId: location.profileId,
+                          bucket: location.bucket,
+                          key: `${location.prefix}${cleanName}${folder ? "/" : ""}`,
+                        },
+                        collisionPolicy: "ask",
+                      });
+                    }}
+                    onNextPage={() => {
+                      if (location && listing?.nextToken)
+                        void listEntries(location, listing.nextToken);
+                    }}
+                  />
+                </div>
 
-          <ObjectInspector
-            metadata={metadata}
-            preview={preview}
-            shareLink={shareLink}
-            loading={loading}
-            onPreview={() => {
-              if (metadata) {
-                void loadPreview({
-                  schemaVersion: 1,
-                  profileId: metadata.profileId,
-                  bucket: metadata.bucket,
-                  key: metadata.key,
-                });
-              }
-            }}
-            onShare={(expiresInSeconds) => {
-              if (metadata) {
-                void createShare({
-                  schemaVersion: 1,
-                  profileId: metadata.profileId,
-                  bucket: metadata.bucket,
-                  key: metadata.key,
-                  expiresInSeconds,
-                });
-              }
-            }}
-            onClosePreview={clearPreview}
-            onMetadataSaved={(nextMetadata) => {
-              void loadMetadata({
-                schemaVersion: 1,
-                profileId: nextMetadata.profileId,
-                bucket: nextMetadata.bucket,
-                key: nextMetadata.key,
-              });
-            }}
-          />
+                <div className="min-w-0 xl:sticky xl:top-6 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
+                  <ObjectInspector
+                    metadata={metadata}
+                    preview={preview}
+                    shareLink={shareLink}
+                    loading={loading}
+                    onPreview={() => {
+                      if (metadata) {
+                        void loadPreview({
+                          schemaVersion: 1,
+                          profileId: metadata.profileId,
+                          bucket: metadata.bucket,
+                          key: metadata.key,
+                        });
+                      }
+                    }}
+                    onShare={(expiresInSeconds) => {
+                      if (metadata) {
+                        void createShare({
+                          schemaVersion: 1,
+                          profileId: metadata.profileId,
+                          bucket: metadata.bucket,
+                          key: metadata.key,
+                          expiresInSeconds,
+                        });
+                      }
+                    }}
+                    onClosePreview={clearPreview}
+                    onMetadataSaved={(nextMetadata) => {
+                      void loadMetadata({
+                        schemaVersion: 1,
+                        profileId: nextMetadata.profileId,
+                        bucket: nextMetadata.bucket,
+                        key: nextMetadata.key,
+                      });
+                    }}
+                  />
+                </div>
+              </div>
+            </>
+          )}
 
-          <TransfersPanel
-            id="transfers"
-            profileId={selectedProfileId}
-            defaultBucket={
-              location?.bucket ?? activeProfile?.defaultBucket ?? ""
-            }
-            transfers={transfers}
-            loading={transferLoading}
-            onRefresh={() => void refreshTransfers()}
-            onStart={startTransfer}
-            onPause={pauseTransfer}
-            onResume={resumeTransfer}
-            onCancel={cancelTransfer}
-            onRetry={retryTransfer}
-            onClear={clearTransferHistory}
-          />
+          {activeSection === "transfers" && (
+            <TransfersPanel
+              id="transfers"
+              profileId={selectedProfileId}
+              defaultBucket={
+                location?.bucket ?? activeProfile?.defaultBucket ?? ""
+              }
+              transfers={transfers}
+              loading={transferLoading}
+              onRefresh={() => void refreshTransfers()}
+              onStart={startTransfer}
+              onPause={pauseTransfer}
+              onResume={resumeTransfer}
+              onCancel={cancelTransfer}
+              onRetry={retryTransfer}
+              onClear={clearTransferHistory}
+            />
+          )}
 
-          <SettingsPanel
-            id="settings"
-            settings={settings}
-            onSaved={bootstrap}
-          />
-          <DiagnosticsPanel
-            id="diagnostics"
-            automaticUpdateCheck={settings?.automaticUpdateCheck ?? true}
-            hasActiveTransfers={hasActiveTransfers}
-          />
+          {activeSection === "settings" && (
+            <>
+              <SettingsPanel
+                id="settings"
+                settings={settings}
+                onSaved={bootstrap}
+              />
+              <DiagnosticsPanel
+                id="diagnostics"
+                automaticUpdateCheck={settings?.automaticUpdateCheck ?? true}
+                hasActiveTransfers={hasActiveTransfers}
+              />
+            </>
+          )}
 
           <footer className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-muted">
             <span>
@@ -1996,6 +2101,7 @@ function ExplorerPanel({
   return (
     <section
       id="explorer"
+      role="tabpanel"
       className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -3121,6 +3227,7 @@ function TransfersPanel({
   return (
     <section
       id={id}
+      role="tabpanel"
       className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -3637,6 +3744,7 @@ function SettingsPanel({
   return (
     <section
       id={id}
+      role="tabpanel"
       className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -4205,9 +4313,6 @@ function ProfileEditor({
     draft.provider === "customS3" ||
     draft.provider === "minio" ||
     draft.provider === "cloudflareR2";
-  const clearSecretFields = () => {
-    secretFields.current = { secretAccessKey: "", sessionToken: "" };
-  };
   const setProvider = (provider: ProviderType) => {
     if (provider === "cloudflareR2") secretFields.current.sessionToken = "";
     const defaults: Record<ProviderType, Partial<ProfileDraft>> = {
@@ -4258,7 +4363,6 @@ function ProfileEditor({
             secretAccessKey: secretFields.current.secretAccessKey || undefined,
             sessionToken: secretFields.current.sessionToken || undefined,
           };
-          clearSecretFields();
           void onSave(payload);
         }}
       >
@@ -4494,7 +4598,6 @@ function ProfileEditor({
                   secretFields.current.secretAccessKey || undefined,
                 sessionToken: secretFields.current.sessionToken || undefined,
               };
-              clearSecretFields();
               onTest(payload);
             }}
             disabled={saving || testing}
