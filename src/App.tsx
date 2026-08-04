@@ -2397,11 +2397,11 @@ function ExplorerPanel({
           {visibleEntries.length > 0 ? (
             viewMode === "list" ? (
               <div
-                className="overflow-x-auto rounded-2xl border border-border"
+                className="max-h-[60vh] overflow-auto rounded-2xl border border-border"
                 role="grid"
                 aria-label="Loaded objects"
               >
-                <div className="grid min-w-[640px] grid-cols-[minmax(220px,1fr)_120px_110px_180px_140px] gap-3 border-b border-border bg-canvas px-4 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted">
+                <div className="sticky top-0 z-10 grid min-w-[640px] grid-cols-[minmax(220px,1fr)_120px_110px_180px_140px] gap-3 border-b border-border bg-canvas px-4 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted">
                   <button
                     className="text-left"
                     type="button"
@@ -2504,68 +2504,70 @@ function ExplorerPanel({
                 ))}
               </div>
             ) : (
-              <div
-                className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-                role="grid"
-                aria-label="Loaded objects"
-              >
-                {visibleEntries.map((entry) => (
-                  <button
-                    className={`rounded-2xl border p-4 text-left transition ${selectedIds.has(entry.id) ? "border-accent bg-accent/10" : "border-border hover:border-accent hover:bg-canvas"} ${dropTargetId === entry.id ? "outline outline-2 outline-accent outline-offset-2" : ""}`}
-                    key={entry.id}
-                    draggable
-                    type="button"
-                    ref={(element) => {
-                      entryRefs.current[entry.id] = element;
-                    }}
-                    aria-selected={selectedIds.has(entry.id)}
-                    onClick={(event) => updateSelection(entry, event)}
-                    onContextMenu={(event) => openContextMenu(event, entry)}
-                    onDragStart={(event) => beginRemoteDrag(event, entry)}
-                    onDragEnd={finishRemoteDrag}
-                    onDragOver={
-                      entry.kind === "file"
-                        ? undefined
-                        : (event) => allowRemoteDrop(event, entry.id)
-                    }
-                    onDragLeave={
-                      entry.kind === "file"
-                        ? undefined
-                        : () => setDropTargetId(null)
-                    }
-                    onDrop={
-                      entry.kind === "file"
-                        ? undefined
-                        : (event) =>
-                            dropRemoteEntries(
-                              event,
-                              entry.key.endsWith("/")
-                                ? entry.key
-                                : `${entry.key}/`,
-                              entry.id,
-                            )
-                    }
-                    onDoubleClick={() => activateEntry(entry)}
-                  >
-                    <span
-                      className="mb-4 grid size-12 place-items-center rounded-xl bg-canvas text-xl"
-                      aria-hidden="true"
+              <div className="max-h-[60vh] overflow-y-auto rounded-2xl border border-border p-3">
+                <div
+                  className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                  role="grid"
+                  aria-label="Loaded objects"
+                >
+                  {visibleEntries.map((entry) => (
+                    <button
+                      className={`rounded-2xl border p-4 text-left transition ${selectedIds.has(entry.id) ? "border-accent bg-accent/10" : "border-border hover:border-accent hover:bg-canvas"} ${dropTargetId === entry.id ? "outline outline-2 outline-accent outline-offset-2" : ""}`}
+                      key={entry.id}
+                      draggable
+                      type="button"
+                      ref={(element) => {
+                        entryRefs.current[entry.id] = element;
+                      }}
+                      aria-selected={selectedIds.has(entry.id)}
+                      onClick={(event) => updateSelection(entry, event)}
+                      onContextMenu={(event) => openContextMenu(event, entry)}
+                      onDragStart={(event) => beginRemoteDrag(event, entry)}
+                      onDragEnd={finishRemoteDrag}
+                      onDragOver={
+                        entry.kind === "file"
+                          ? undefined
+                          : (event) => allowRemoteDrop(event, entry.id)
+                      }
+                      onDragLeave={
+                        entry.kind === "file"
+                          ? undefined
+                          : () => setDropTargetId(null)
+                      }
+                      onDrop={
+                        entry.kind === "file"
+                          ? undefined
+                          : (event) =>
+                              dropRemoteEntries(
+                                event,
+                                entry.key.endsWith("/")
+                                  ? entry.key
+                                  : `${entry.key}/`,
+                                entry.id,
+                              )
+                      }
+                      onDoubleClick={() => activateEntry(entry)}
                     >
-                      {entry.kind === "file" ? "▪" : "▰"}
-                    </span>
-                    <span
-                      className="block truncate font-medium"
-                      title={entry.key}
-                    >
-                      {entry.displayName}
-                    </span>
-                    <span className="mt-1 block text-xs text-muted">
-                      {entry.kind === "file"
-                        ? `${entry.contentTypeHint ?? "File"} · ${formatBytes(entry.size)}`
-                        : "Folder"}
-                    </span>
-                  </button>
-                ))}
+                      <span
+                        className="mb-4 grid size-12 place-items-center rounded-xl bg-canvas text-xl"
+                        aria-hidden="true"
+                      >
+                        {entry.kind === "file" ? "▪" : "▰"}
+                      </span>
+                      <span
+                        className="block truncate font-medium"
+                        title={entry.key}
+                      >
+                        {entry.displayName}
+                      </span>
+                      <span className="mt-1 block text-xs text-muted">
+                        {entry.kind === "file"
+                          ? `${entry.contentTypeHint ?? "File"} · ${formatBytes(entry.size)}`
+                          : "Folder"}
+                      </span>
+                    </button>
+                  ))}
+                </div>
               </div>
             )
           ) : (
