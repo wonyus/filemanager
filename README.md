@@ -31,3 +31,7 @@ pnpm tauri dev
 ```
 
 The application deliberately does not return permanent credentials to the frontend. Secrets cross the IPC boundary only as write-only inputs and are stored through the Rust credential-store abstraction.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
