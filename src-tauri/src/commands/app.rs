@@ -8,6 +8,6 @@ pub fn get_app_info() -> AppInfo {
         product_name: "S3 File Manager".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: 1,
-        phase: "foundation".to_string(),
+        phase: "packaging".to_string(),
     }
 }

@@ -4,16 +4,19 @@ Windows-first S3-compatible object storage manager built with Tauri 2, React, Ty
 
 ## Current status
 
-Phase 0 foundation is in place:
+The MVP implementation is in place for the Windows-first release:
 
 - Tauri 2 application shell with a restricted default capability.
 - React + TypeScript + Vite frontend with a typed command wrapper and Zustand store.
 - Rust application boundary with stable public error envelopes.
 - Transactional SQLite migration baseline in the platform application-data directory.
 - Credential-store abstraction with a Windows Credential Manager adapter and a safe in-memory development adapter.
-- CI checks for frontend lint/test/build and Rust format/test/clippy.
+- Provider presets, profile lifecycle transactions, bucket/prefix explorer, metadata/preview/share links, and the Rust transfer queue are wired end to end.
+- Recursive upload/download/copy/move/delete planning includes collision handling, cancellation checkpoints, and bounded provider batches.
+- Redacted diagnostics export, settings persistence, and a per-user NSIS installer are included.
+- CI checks frontend lint/test/build, Rust format/test/clippy, and Windows NSIS packaging.
 
-The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Profile CRUD and S3 provider integration are the next Phase 1 increment.
+The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Persistent transfer resume and signed update manifests remain release-hardening work.
 
 ## Development
 
