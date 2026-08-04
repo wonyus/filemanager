@@ -20,11 +20,10 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
-# This workflow intentionally has no fallback values for signing material or
-# deployment URLs.  It must run in a protected GitHub environment with the
-# secrets documented in release-hardening.md.
+# Signing material remains protected in the GitHub environment. Update URLs
+# are derived from the GitHub Release endpoints for the selected channel.
 jobs:
   windows-release:
     runs-on: windows-latest
@@ -34,9 +33,6 @@ jobs:
       S3FM_RELEASE_CHANNEL: ${{ inputs.channel }}
       S3FM_RELEASE_NOTES: ${{ inputs.notes }}
       S3FM_RELEASE_PUB_DATE: ${{ github.event.repository.updated_at }}
-      S3FM_UPDATE_MANIFEST_URL_STABLE: ${{ secrets.S3FM_UPDATE_MANIFEST_URL_STABLE }}
-      S3FM_UPDATE_MANIFEST_URL_BETA: ${{ secrets.S3FM_UPDATE_MANIFEST_URL_BETA }}
-      S3FM_UPDATE_ARTIFACT_BASE_URL: ${{ secrets.S3FM_UPDATE_ARTIFACT_BASE_URL }}
       TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -59,6 +55,23 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - run: pnpm install --frozen-lockfile
+      - name: Configure GitHub Release update URLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repository = $env:GITHUB_REPOSITORY
+          $stableManifest = "https://github.com/$repository/releases/latest/download/stable-latest.json"
+          $betaManifest = "https://github.com/$repository/releases/download/beta-latest/beta-latest.json"
+          if ($env:S3FM_RELEASE_CHANNEL -eq 'stable') {
+            $artifactBase = "https://github.com/$repository/releases/latest/download/"
+          } else {
+            $artifactBase = "https://github.com/$repository/releases/download/beta-latest/"
+          }
+          @(
+            "S3FM_UPDATE_MANIFEST_URL_STABLE=$stableManifest"
+            "S3FM_UPDATE_MANIFEST_URL_BETA=$betaManifest"
+            "S3FM_UPDATE_ARTIFACT_BASE_URL=$artifactBase"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Import base64 Authenticode certificate when supplied
         if: ${{ env.WINDOWS_CERTIFICATE != '' }}
         shell: pwsh
@@ -111,6 +124,56 @@ jobs:
         run: pnpm release:manifest
       - name: Verify NSIS installer
         run: pnpm verify:installer -- --required
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $channel = $env:S3FM_RELEASE_CHANNEL
+          $version = $env:S3FM_RELEASE_VERSION
+          $manifest = Join-Path $env:GITHUB_WORKSPACE "dist/updater/$channel-latest.json"
+          if (-not (Test-Path -LiteralPath $manifest)) { throw "Update manifest was not generated: $manifest" }
+
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis" -File -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not generated' }
+          $archive = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File -Filter '*.zip' | Where-Object { $_.Name -notlike '*.sig' } | Select-Object -First 1
+          if (-not $archive) { throw 'Updater archive was not generated' }
+          $signature = Get-Item "$($archive.FullName).sig" -ErrorAction SilentlyContinue
+          if (-not $signature) { throw "Updater signature was not generated: $($archive.FullName).sig" }
+
+          $assetPaths = @($installer.FullName, $archive.FullName, $signature.FullName, $manifest)
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE 'dist/updater/checksums.txt'
+          $checksumLines = foreach ($assetPath in $assetPaths) {
+            $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$([IO.Path]::GetFileName($assetPath))"
+          }
+          $checksumLines | Set-Content -LiteralPath $checksumPath -Encoding ascii
+          $assetPaths += $checksumPath
+
+          $tag = if ($channel -eq 'stable') { "v$version" } else { 'beta-latest' }
+          $title = if ($channel -eq 'stable') { "S3 File Manager v$version" } else { "S3 File Manager $version Beta" }
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes = $env:S3FM_RELEASE_NOTES
+          if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "S3 File Manager $version" }
+          $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          if ($channel -eq 'beta' -and $releaseExists) {
+            & gh release upload $tag --repo $env:GITHUB_REPOSITORY --clobber $assetPaths
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to upload beta release assets' }
+            & gh release edit $tag --repo $env:GITHUB_REPOSITORY --title $title --notes-file $notesPath --prerelease --draft=false
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to update beta release metadata' }
+          } elseif (-not $releaseExists) {
+            $releaseArgs = @('release', 'create', $tag, '--repo', $env:GITHUB_REPOSITORY, '--target', $env:GITHUB_SHA, '--title', $title, '--notes-file', $notesPath)
+            if ($channel -eq 'beta') { $releaseArgs += '--prerelease' }
+            $releaseArgs += $assetPaths
+            & gh @releaseArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to publish GitHub Release' }
+          } else {
+            throw "Release tag already exists: $tag"
+          }
       - name: Upload release artifacts for deployment
         uses: actions/upload-artifact@v4
         with:
@@ -121,3 +184,4 @@ jobs:
             src-tauri/target/release/bundle/**/*.zip
             src-tauri/target/release/bundle/**/*.sig
             dist/updater/*.json
+            dist/updater/checksums.txt

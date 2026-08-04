@@ -14,9 +14,9 @@ The protected release job supplies the following environment values:
 | `S3FM_RELEASE_CHANNEL` | `stable` or `beta` |
 | `S3FM_RELEASE_PUB_DATE` | ISO-8601 publication timestamp |
 | `S3FM_RELEASE_NOTES` | Human-readable release notes |
-| `S3FM_UPDATE_MANIFEST_URL_STABLE` | HTTPS stable manifest URL |
-| `S3FM_UPDATE_MANIFEST_URL_BETA` | HTTPS beta manifest URL |
-| `S3FM_UPDATE_ARTIFACT_BASE_URL` | HTTPS directory where the signed updater archive is published |
+| `S3FM_UPDATE_MANIFEST_URL_STABLE` | Derived GitHub Release URL for the stable manifest |
+| `S3FM_UPDATE_MANIFEST_URL_BETA` | Derived GitHub Release URL for the rolling beta manifest |
+| `S3FM_UPDATE_ARTIFACT_BASE_URL` | Derived GitHub Release download directory for the selected channel |
 | `S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64` | HTTPS URL for the signed Windows updater archive |
 | `TAURI_UPDATER_PUBLIC_KEY` | Public key embedded in the generated Tauri config |
 | `TAURI_SIGNING_PRIVATE_KEY` | Protected Tauri updater signing key |
@@ -30,6 +30,12 @@ The protected release job supplies the following environment values:
 `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` may be provided together when the
 runner imports a certificate as part of its protected setup. They are never
 required in pull-request jobs and are never printed by the validator.
+
+The three update URL values in the table are derived by the workflow and do
+not need to be stored as secrets. Stable builds resolve through the GitHub
+`latest` release endpoint; beta builds resolve through the rolling
+`beta-latest` release endpoint. The workflow publishes the generated files to
+those endpoints after signing.
 
 ## Commands
 
@@ -62,17 +68,20 @@ artifact exists. Clean-VM installation, WebView2 offline behavior, signature
 tamper rejection, and uninstall-data preservation remain release-runner tests
 because they require a Windows VM and protected signing material.
 
-The protected workflow validates the build overlay first with
+The protected workflow derives the update URLs from GitHub Releases, then
+validates the build overlay with
 `node scripts/validate-release-config.mjs --strict --config-only`. The Tauri
 build creates the updater archive and its `.sig` file; only then does the
 workflow derive `S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64` and generate the
 static channel manifest. This avoids inventing a signature before protected
-signing runs.
+signing runs. Stable releases use the `latest` GitHub Release endpoint; beta
+releases use a rolling `beta-latest` release tag.
 
-The manual workflow is `.github/workflows/release.yml`. It uploads the
-installer, updater archive, signature, and manifest as a CI artifact. A
-deployment job or release host must publish them at the configured HTTPS URLs;
-stable and beta manifest URLs are intentionally separate.
+The manual workflow is `.github/workflows/release.yml`. It publishes a GitHub
+Release with the installer, updater archive, signature, channel manifest, and
+`checksums.txt`, and also uploads the same files as a CI artifact. Stable and
+beta manifest URLs are intentionally separate. The GitHub Release permission
+is protected by the `protected-release` environment.
 
 The optional `updater` Cargo feature is enabled only by that protected
 workflow. Development/PR binaries return a typed “not configured” result from
