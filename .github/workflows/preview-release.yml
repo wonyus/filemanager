@@ -50,7 +50,14 @@ jobs:
         shell: pwsh
         run: pnpm tauri build --bundles nsis --no-sign --config $env:PREVIEW_CONFIG_PATH
       - name: Verify preview installer
-        run: pnpm verify:installer -- --required
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis' -File -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not generated' }
+          $env:S3FM_INSTALLER_PATH = $installer.FullName
+          pnpm verify:installer -- --required
+          if ($LASTEXITCODE -ne 0) { throw 'Preview installer verification failed' }
       - name: Publish GitHub preview release
         shell: pwsh
         env:
