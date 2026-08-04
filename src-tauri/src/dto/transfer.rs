@@ -12,6 +12,10 @@ fn default_schema_version() -> u16 {
     DTO_SCHEMA_VERSION
 }
 
+fn default_preserve_root() -> bool {
+    true
+}
+
 /// A long-running operation that is owned by the Rust transfer manager.
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -323,7 +327,7 @@ pub struct StartTransferRequest {
     pub recursive: bool,
     /// Upload-directory policy: include the selected folder name in the
     /// destination prefix when enabled.
-    #[serde(default)]
+    #[serde(default = "default_preserve_root")]
     pub preserve_root: bool,
     /// Copy metadata policy. `false` preserves source metadata; `true` uses
     /// replacement metadata supplied in `metadata` (or clears it when absent).
