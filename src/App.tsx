@@ -702,6 +702,56 @@ function App() {
                 key: entry.key,
               });
             }}
+            onDownloadSelection={async (entries) => {
+              if (!location || entries.length === 0) return;
+              try {
+                const destination =
+                  entries.length === 1 && entries[0].kind === "file"
+                    ? hasNativeTauriRuntime()
+                      ? await commands.pickSaveFile(entries[0].displayName)
+                      : window.prompt(
+                          "Download destination path",
+                          entries[0].displayName,
+                        )
+                    : hasNativeTauriRuntime()
+                      ? await commands.pickDirectory()
+                      : window.prompt("Download destination folder");
+                if (!destination?.trim()) return;
+                for (const entry of entries) {
+                  void startTransfer({
+                    schemaVersion: 1,
+                    operation:
+                      entry.kind === "file" ? "downloadFile" : "downloadPrefix",
+                    profileId: location.profileId,
+                    source: {
+                      kind: "remote",
+                      profileId: location.profileId,
+                      bucket: location.bucket,
+                      key: entry.key,
+                    },
+                    destination: { kind: "local", path: destination.trim() },
+                    collisionPolicy: "ask",
+                    recursive: entry.kind !== "file",
+                  });
+                }
+              } catch (error) {
+                window.alert(formatCommandError(error));
+              }
+            }}
+            onShareEntry={(entry) => {
+              if (!location) return;
+              const request = {
+                schemaVersion: 1,
+                profileId: location.profileId,
+                bucket: location.bucket,
+                key: entry.key,
+              };
+              void loadMetadata(request).then((nextMetadata) => {
+                if (nextMetadata?.shareSupported) {
+                  void createShare(request);
+                }
+              });
+            }}
             onOpenFile={async (entry) => {
               if (!location) return;
               const request = {
@@ -737,6 +787,49 @@ function App() {
                   },
                   confirmation,
                   recursive: entry.kind !== "file",
+                });
+              }
+            }}
+            onPasteSelection={(entries, mode, sourceLocation) => {
+              if (!location || entries.length === 0) return;
+              if (sourceLocation.profileId !== location.profileId) {
+                window.alert(
+                  "Remote copy and move between different profiles are not supported in MVP.",
+                );
+                return;
+              }
+              for (const entry of entries) {
+                const sourceName = entry.key
+                  .replace(/\/+$/, "")
+                  .split("/")
+                  .pop();
+                if (!sourceName) continue;
+                const isFolder = entry.kind !== "file";
+                void startTransfer({
+                  schemaVersion: 1,
+                  operation:
+                    mode === "copy"
+                      ? isFolder
+                        ? "copyPrefix"
+                        : "copyObject"
+                      : isFolder
+                        ? "movePrefix"
+                        : "moveObject",
+                  profileId: location.profileId,
+                  source: {
+                    kind: "remote",
+                    profileId: sourceLocation.profileId,
+                    bucket: sourceLocation.bucket,
+                    key: entry.key,
+                  },
+                  destination: {
+                    kind: "remote",
+                    profileId: location.profileId,
+                    bucket: location.bucket,
+                    key: `${location.prefix}${sourceName}${isFolder ? "/" : ""}`,
+                  },
+                  collisionPolicy: "ask",
+                  recursive: isFolder,
                 });
               }
             }}
@@ -1047,8 +1140,11 @@ function ExplorerPanel({
   onOpenLocation,
   onRefresh,
   onSelectEntry,
+  onDownloadSelection,
+  onShareEntry,
   onOpenFile,
   onDeleteSelection,
+  onPasteSelection,
   onCreateFolder,
   onRenameEntry,
   onNextPage,
@@ -1069,8 +1165,15 @@ function ExplorerPanel({
   onOpenLocation: (location: ExplorerLocation) => void;
   onRefresh: () => void;
   onSelectEntry: (entry: EntrySummary) => void;
+  onDownloadSelection: (entries: EntrySummary[]) => void;
+  onShareEntry: (entry: EntrySummary) => void;
   onOpenFile: (entry: EntrySummary) => Promise<void>;
   onDeleteSelection: (entries: EntrySummary[]) => void;
+  onPasteSelection: (
+    entries: EntrySummary[],
+    mode: "copy" | "move",
+    sourceLocation: ExplorerLocation,
+  ) => void;
   onCreateFolder: (name: string) => void;
   onRenameEntry: (entry: EntrySummary, nextName: string) => void;
   onNextPage: () => void;
@@ -1093,6 +1196,21 @@ function ExplorerPanel({
     readSavedLocations("s3-file-manager-recent-v1"),
   );
   const scopeRef = useRef("");
+  const filterRef = useRef<HTMLInputElement>(null);
+  const breadcrumbRef = useRef<HTMLButtonElement>(null);
+  const entryRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    entries: EntrySummary[];
+    target?: EntrySummary;
+  } | null>(null);
+  const [remoteClipboard, setRemoteClipboard] = useState<{
+    mode: "copy" | "move";
+    entries: EntrySummary[];
+    sourceLocation: ExplorerLocation;
+  } | null>(null);
 
   const rootPrefix = activeProfile?.rootPrefix ?? "";
   const scope = location
@@ -1102,6 +1220,7 @@ function ExplorerPanel({
   useEffect(() => {
     setSelectedIds(new Set());
     setFocusedId(null);
+    setContextMenu(null);
     const nextScope = location
       ? `${location.profileId}:${location.bucket}`
       : "";
@@ -1112,6 +1231,23 @@ function ExplorerPanel({
     }
     scopeRef.current = scope;
   }, [location, scope]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && !contextMenuRef.current?.contains(target)) {
+        setContextMenu(null);
+      }
+    };
+    const closeOnScroll = () => setContextMenu(null);
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    window.addEventListener("scroll", closeOnScroll, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+      window.removeEventListener("scroll", closeOnScroll, true);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     if (!listing) return;
@@ -1265,6 +1401,59 @@ function ExplorerPanel({
     return [...filtered].sort(compare);
   }, [filter, loadedEntries, sortDescending, sortKey]);
 
+  const selectedEntries = useMemo(
+    () => loadedEntries.filter((entry) => selectedIds.has(entry.id)),
+    [loadedEntries, selectedIds],
+  );
+
+  const focusEntry = (id: string | null) => {
+    setFocusedId(id);
+    if (id) {
+      window.requestAnimationFrame(() => entryRefs.current[id]?.focus());
+    }
+  };
+
+  const contextEntries = contextMenu?.entries ?? selectedEntries;
+  const contextTarget =
+    contextMenu?.target ??
+    (contextEntries.length === 1 ? contextEntries[0] : undefined);
+  const contextIsFolder = contextTarget ? contextTarget.kind !== "file" : false;
+
+  const stageRemoteClipboard = (mode: "copy" | "move") => {
+    if (!location || contextEntries.length === 0) return;
+    setRemoteClipboard({
+      mode,
+      entries: [...contextEntries],
+      sourceLocation: location,
+    });
+    setContextMenu(null);
+  };
+
+  const openContextMenu = (
+    event: MouseEvent<HTMLElement>,
+    entry?: EntrySummary,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    let entries = selectedEntries;
+    if (entry && !selectedIds.has(entry.id)) {
+      entries = [entry];
+      setSelectedIds(new Set([entry.id]));
+      focusEntry(entry.id);
+    }
+    const menuWidth = 248;
+    const menuHeight = (entry?.kind ?? entries[0]?.kind) !== "file" ? 360 : 420;
+    const x = Math.max(
+      8,
+      Math.min(event.clientX, window.innerWidth - menuWidth - 8),
+    );
+    const y = Math.max(
+      8,
+      Math.min(event.clientY, window.innerHeight - menuHeight - 8),
+    );
+    setContextMenu({ x, y, entries: [...entries], target: entry });
+  };
+
   const navigatePrefix = useCallback(
     (prefix: string) => {
       if (!location || prefix === location.prefix) return;
@@ -1337,7 +1526,7 @@ function ExplorerPanel({
       }
       return new Set([entry.id]);
     });
-    setFocusedId(entry.id);
+    focusEntry(entry.id);
     if (entry.kind === "file") onSelectEntry(entry);
   };
 
@@ -1351,16 +1540,56 @@ function ExplorerPanel({
     ) {
       onDeleteSelection(selected);
       setSelectedIds(new Set());
+      setContextMenu(null);
     }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     if (["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
+    const commandKey = event.ctrlKey || event.metaKey;
     const focusedIndex = visibleEntries.findIndex(
       (entry) => entry.id === focusedId,
     );
-    if (event.altKey && event.key === "ArrowLeft") {
+    const focused = visibleEntries.find((entry) => entry.id === focusedId);
+    if (commandKey && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      filterRef.current?.focus();
+    } else if (commandKey && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      breadcrumbRef.current?.focus();
+    } else if (commandKey && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      if (location && selectedEntries.length > 0) {
+        setRemoteClipboard({
+          mode: "copy",
+          entries: [...selectedEntries],
+          sourceLocation: location,
+        });
+      }
+    } else if (commandKey && event.key.toLowerCase() === "x") {
+      event.preventDefault();
+      if (location && selectedEntries.length > 0) {
+        setRemoteClipboard({
+          mode: "move",
+          entries: [...selectedEntries],
+          sourceLocation: location,
+        });
+      }
+    } else if (commandKey && event.key.toLowerCase() === "v") {
+      event.preventDefault();
+      if (remoteClipboard && location) {
+        onPasteSelection(
+          remoteClipboard.entries,
+          remoteClipboard.mode,
+          remoteClipboard.sourceLocation,
+        );
+        if (remoteClipboard.mode === "move") setRemoteClipboard(null);
+      }
+    } else if (event.altKey && event.key === "Enter") {
+      event.preventDefault();
+      if (focused) onSelectEntry(focused);
+    } else if (event.altKey && event.key === "ArrowLeft") {
       event.preventDefault();
       goBack();
     } else if (event.altKey && event.key === "ArrowRight") {
@@ -1370,15 +1599,14 @@ function ExplorerPanel({
       event.preventDefault();
       const next =
         visibleEntries[Math.min(focusedIndex + 1, visibleEntries.length - 1)];
-      if (next) setFocusedId(next.id);
+      if (next) focusEntry(next.id);
     } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
       event.preventDefault();
       const next =
         visibleEntries[Math.max(focusedIndex <= 0 ? 0 : focusedIndex - 1, 0)];
-      if (next) setFocusedId(next.id);
+      if (next) focusEntry(next.id);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      const focused = visibleEntries.find((entry) => entry.id === focusedId);
       if (focused) activateEntry(focused);
     } else if (
       event.key === "Backspace" ||
@@ -1390,22 +1618,20 @@ function ExplorerPanel({
       event.preventDefault();
       renameSelection();
     } else if (
-      (event.ctrlKey || event.metaKey) &&
+      commandKey &&
       event.shiftKey &&
       event.key.toLowerCase() === "n"
     ) {
       event.preventDefault();
       createFolder();
-    } else if (
-      (event.ctrlKey || event.metaKey) &&
-      event.key.toLowerCase() === "a"
-    ) {
+    } else if (commandKey && event.key.toLowerCase() === "a") {
       event.preventDefault();
       setSelectedIds(new Set(visibleEntries.map((entry) => entry.id)));
-      setFocusedId(visibleEntries[0]?.id ?? null);
+      focusEntry(visibleEntries[0]?.id ?? null);
     } else if (event.key === "Escape") {
       event.preventDefault();
-      setSelectedIds(new Set());
+      if (contextMenu) setContextMenu(null);
+      else setSelectedIds(new Set());
     } else if (event.key === "Delete") {
       event.preventDefault();
       deleteSelection();
@@ -1423,9 +1649,6 @@ function ExplorerPanel({
     }
   };
 
-  const bookmarkId = location
-    ? `${location.profileId}:${location.bucket}:${location.prefix}`
-    : "";
   const existingBookmark = location
     ? bookmarks.find(
         (item) =>
@@ -1435,30 +1658,35 @@ function ExplorerPanel({
       )
     : undefined;
   const isBookmarked = Boolean(existingBookmark);
-  const toggleBookmark = () => {
-    if (!location) return;
-    if (isBookmarked) {
-      setBookmarks((items) =>
-        items.filter((item) => item.id !== existingBookmark?.id),
-      );
-      const numericId = Number(existingBookmark?.id);
+  const toggleBookmarkFor = (
+    target: ExplorerLocation,
+    requestedName?: string,
+  ) => {
+    const bookmarkId = `${target.profileId}:${target.bucket}:${target.prefix}`;
+    const existing = bookmarks.find(
+      (item) =>
+        item.profileId === target.profileId &&
+        item.bucket === target.bucket &&
+        item.prefix === target.prefix,
+    );
+    if (existing) {
+      setBookmarks((items) => items.filter((item) => item.id !== existing.id));
+      const numericId = Number(existing.id);
       if (Number.isSafeInteger(numericId)) {
         void commands.removeBookmark(numericId).catch(() => undefined);
       }
       return;
     }
-    const defaultName = `${location.bucket}/${location.prefix}`.replace(
-      /\/$/,
-      "",
-    );
-    const name = window.prompt("Bookmark name", defaultName)?.trim();
+    const defaultName = `${target.bucket}/${target.prefix}`.replace(/\/$/, "");
+    const name =
+      requestedName ?? window.prompt("Bookmark name", defaultName)?.trim();
     if (!name) return;
     void commands
       .addBookmark({
         schemaVersion: 1,
-        profileId: location.profileId,
-        bucket: location.bucket,
-        prefix: location.prefix,
+        profileId: target.profileId,
+        bucket: target.bucket,
+        prefix: target.prefix,
         name,
       })
       .then((stored) => {
@@ -1475,9 +1703,9 @@ function ExplorerPanel({
             ...items.filter(
               (item) =>
                 !(
-                  item.profileId === location.profileId &&
-                  item.bucket === location.bucket &&
-                  item.prefix === location.prefix
+                  item.profileId === target.profileId &&
+                  item.bucket === target.bucket &&
+                  item.prefix === target.prefix
                 ),
             ),
           ].slice(0, 100),
@@ -1489,13 +1717,18 @@ function ExplorerPanel({
             {
               id: bookmarkId,
               name,
-              ...location,
+              ...target,
               visitedAt: new Date().toISOString(),
             },
             ...items.filter((item) => item.id !== bookmarkId),
           ].slice(0, 100),
         );
       });
+  };
+
+  const toggleBookmark = () => {
+    if (!location) return;
+    toggleBookmarkFor(location);
   };
 
   const selectedEntry =
@@ -1516,6 +1749,77 @@ function ExplorerPanel({
     if (!name) return;
     onCreateFolder(name);
   };
+
+  const runContextAction = (
+    action:
+      | "preview"
+      | "download"
+      | "copy"
+      | "move"
+      | "rename"
+      | "share"
+      | "properties"
+      | "propertiesSummary"
+      | "delete"
+      | "open"
+      | "bookmark",
+  ) => {
+    const entries = contextEntries;
+    const single = contextTarget;
+    setContextMenu(null);
+    if (action === "preview" && single?.kind === "file") {
+      void onOpenFile(single);
+    } else if (action === "download" && entries.length > 0) {
+      onDownloadSelection(entries);
+    } else if (action === "copy" || action === "move") {
+      stageRemoteClipboard(action);
+    } else if (action === "rename" && single) {
+      const initialName = single.displayName.replace(/\/$/, "");
+      const nextName = window.prompt("Rename selected item", initialName);
+      if (nextName && nextName.trim() !== initialName) {
+        onRenameEntry(single, nextName);
+      }
+    } else if (action === "share" && single?.kind === "file") {
+      onShareEntry(single);
+    } else if (action === "properties" && single) {
+      onSelectEntry(single);
+    } else if (action === "propertiesSummary" && entries.length > 0) {
+      const totalBytes = entries.reduce(
+        (sum, entry) => sum + (entry.size ?? 0),
+        0,
+      );
+      window.alert(
+        `${entries.length} loaded entries\nTotal known size: ${formatBytes(totalBytes)}`,
+      );
+    } else if (action === "delete" && entries.length > 0) {
+      onDeleteSelection(entries);
+      setSelectedIds(new Set());
+    } else if (action === "open" && single) {
+      activateEntry(single);
+    } else if (action === "bookmark" && single && location) {
+      const prefix = single.key.endsWith("/") ? single.key : `${single.key}/`;
+      toggleBookmarkFor({ ...location, prefix }, single.displayName);
+    }
+  };
+
+  const menuItem = (
+    label: string,
+    action: Parameters<typeof runContextAction>[0],
+    enabled: boolean,
+    title?: string,
+  ) => (
+    <button
+      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-medium hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-45"
+      type="button"
+      role="menuitem"
+      onClick={() => runContextAction(action)}
+      disabled={!enabled}
+      title={title}
+    >
+      <span>{label}</span>
+      {!enabled && title && <span aria-hidden="true">ⓘ</span>}
+    </button>
+  );
 
   return (
     <section
@@ -1568,7 +1872,11 @@ function ExplorerPanel({
           ))}
         </div>
       ) : (
-        <div onKeyDown={handleKeyDown} tabIndex={0}>
+        <div
+          onKeyDown={handleKeyDown}
+          onContextMenu={(event) => openContextMenu(event)}
+          tabIndex={0}
+        >
           <div className="mb-3 flex flex-wrap items-center gap-2">
             <button
               className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-semibold hover:bg-canvas disabled:opacity-40"
@@ -1659,6 +1967,7 @@ function ExplorerPanel({
             </select>
             <div className="min-w-[220px] flex-1">
               <input
+                ref={filterRef}
                 className="input w-full text-xs"
                 value={filter}
                 onChange={(event) => setFilter(event.target.value)}
@@ -1720,6 +2029,7 @@ function ExplorerPanel({
                 <button
                   className="rounded px-1.5 py-1 font-medium hover:bg-canvas"
                   type="button"
+                  ref={index === 0 ? breadcrumbRef : undefined}
                   onClick={() => navigatePrefix(crumb.prefix)}
                 >
                   {crumb.label}
@@ -1808,8 +2118,12 @@ function ExplorerPanel({
                     className={`grid w-full min-w-[640px] grid-cols-[minmax(220px,1fr)_120px_110px_180px_140px] items-center gap-3 border-b border-border px-4 py-3 text-left text-sm last:border-b-0 ${selectedIds.has(entry.id) ? "bg-accent/10" : "hover:bg-canvas"}`}
                     key={entry.id}
                     type="button"
+                    ref={(element) => {
+                      entryRefs.current[entry.id] = element;
+                    }}
                     aria-selected={selectedIds.has(entry.id)}
                     onClick={(event) => updateSelection(entry, event)}
+                    onContextMenu={(event) => openContextMenu(event, entry)}
                     onDoubleClick={() => activateEntry(entry)}
                   >
                     <span className="flex min-w-0 items-center gap-3">
@@ -1850,8 +2164,12 @@ function ExplorerPanel({
                     className={`rounded-2xl border p-4 text-left transition ${selectedIds.has(entry.id) ? "border-accent bg-accent/10" : "border-border hover:border-accent hover:bg-canvas"}`}
                     key={entry.id}
                     type="button"
+                    ref={(element) => {
+                      entryRefs.current[entry.id] = element;
+                    }}
                     aria-selected={selectedIds.has(entry.id)}
                     onClick={(event) => updateSelection(entry, event)}
+                    onContextMenu={(event) => openContextMenu(event, entry)}
                     onDoubleClick={() => activateEntry(entry)}
                   >
                     <span
@@ -1894,6 +2212,78 @@ function ExplorerPanel({
               >
                 Load next page
               </button>
+            </div>
+          )}
+          {remoteClipboard && (
+            <p
+              className="mt-3 rounded-xl bg-accent/10 px-3 py-2 text-xs text-accent"
+              role="status"
+            >
+              {remoteClipboard.mode === "copy" ? "Copy" : "Move"} staged for{" "}
+              {remoteClipboard.entries.length} loaded item
+              {remoteClipboard.entries.length === 1 ? "" : "s"}. Navigate to a
+              destination and press Ctrl+V.
+              <button
+                className="ml-2 font-semibold underline"
+                type="button"
+                onClick={() => setRemoteClipboard(null)}
+              >
+                Clear
+              </button>
+            </p>
+          )}
+          {contextMenu && (
+            <div
+              ref={contextMenuRef}
+              className="fixed z-50 min-w-[220px] rounded-xl border border-border bg-panel p-1.5 shadow-xl"
+              style={{ left: contextMenu.x, top: contextMenu.y }}
+              role="menu"
+              aria-label="Explorer context menu"
+            >
+              {contextTarget ? (
+                contextEntries.length > 1 ? (
+                  <>
+                    {menuItem("Download", "download", true)}
+                    {menuItem("Copy", "copy", true)}
+                    {menuItem("Move", "move", true)}
+                    {menuItem("Properties summary", "propertiesSummary", true)}
+                    {menuItem("Delete", "delete", true)}
+                  </>
+                ) : contextIsFolder ? (
+                  <>
+                    {menuItem("Open", "open", true)}
+                    {menuItem("Download Folder", "download", true)}
+                    {menuItem("Copy Folder", "copy", true)}
+                    {menuItem("Move Folder", "move", true)}
+                    {menuItem("Rename Folder", "rename", true)}
+                    {menuItem("Bookmark", "bookmark", Boolean(location))}
+                    {menuItem("Properties", "properties", true)}
+                    {menuItem("Delete Recursively", "delete", true)}
+                  </>
+                ) : (
+                  <>
+                    {menuItem("Preview", "preview", true)}
+                    {menuItem("Download", "download", true)}
+                    {menuItem("Copy", "copy", true)}
+                    {menuItem("Move", "move", true)}
+                    {menuItem("Rename", "rename", true)}
+                    {menuItem(
+                      "Generate Share Link",
+                      "share",
+                      activeProfile?.provider !== "customS3",
+                      activeProfile?.provider === "customS3"
+                        ? "Capability is unknown for Custom S3 until a provider probe succeeds."
+                        : undefined,
+                    )}
+                    {menuItem("Properties", "properties", true)}
+                    {menuItem("Delete", "delete", true)}
+                  </>
+                )
+              ) : (
+                <p className="px-3 py-2 text-xs text-muted">
+                  Select an item to see available actions.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -2203,24 +2593,32 @@ function ObjectInspector({
             <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-canvas p-3 text-xs leading-5">
               {preview.text}
             </pre>
-          ) : preview.url && preview.previewKind === "image" ? (
+          ) : (preview.url || preview.dataUrl) &&
+            preview.previewKind === "image" ? (
             <img
               className="max-h-96 max-w-full rounded-xl bg-canvas object-contain"
-              src={preview.url}
+              src={preview.url ?? preview.dataUrl}
               alt={metadata.key}
             />
-          ) : preview.url && preview.previewKind === "audio" ? (
-            <audio className="w-full" controls src={preview.url} />
-          ) : preview.url && preview.previewKind === "video" ? (
+          ) : (preview.url || preview.dataUrl) &&
+            preview.previewKind === "audio" ? (
+            <audio
+              className="w-full"
+              controls
+              src={preview.url ?? preview.dataUrl}
+            />
+          ) : (preview.url || preview.dataUrl) &&
+            preview.previewKind === "video" ? (
             <video
               className="max-h-96 w-full rounded-xl bg-ink"
               controls
-              src={preview.url}
+              src={preview.url ?? preview.dataUrl}
             />
-          ) : preview.url && preview.previewKind === "pdf" ? (
+          ) : (preview.url || preview.dataUrl) &&
+            preview.previewKind === "pdf" ? (
             <iframe
               className="h-96 w-full rounded-xl border border-border"
-              src={preview.url}
+              src={preview.url ?? preview.dataUrl}
               title={`PDF preview: ${metadata.key}`}
               sandbox=""
             />

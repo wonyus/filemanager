@@ -144,6 +144,7 @@ export type AppErrorCode =
   | "RATE_LIMITED"
   | "PROVIDER_UNAVAILABLE"
   | "LOCAL_PATH_INVALID"
+  | "LOCAL_PATH_TOO_LONG"
   | "LOCAL_PERMISSION_DENIED"
   | "LOCAL_DISK_FULL"
   | "LOCAL_FILE_CHANGED"
@@ -386,6 +387,7 @@ export interface PreviewResult {
   contentType: string;
   text: string;
   url?: string;
+  dataUrl?: string;
   expiresAt?: string;
   bytesRead: number;
   totalSize?: number;

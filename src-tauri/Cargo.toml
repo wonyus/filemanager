@@ -17,7 +17,9 @@ tauri-build = { version = "2", features = [] }
 async-trait = "0.1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
+fs2 = "0.4"
 percent-encoding = "2"
 rfd = "0.15"
 secrecy = { version = "0.10", features = ["serde"] }

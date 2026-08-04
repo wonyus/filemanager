@@ -61,6 +61,7 @@ impl AppState {
             credentials.clone(),
             clients.clone(),
             transfers.clone(),
+            settings.clone(),
         ));
         let transfer_service = Arc::new(TransferService::new(
             profiles.clone(),

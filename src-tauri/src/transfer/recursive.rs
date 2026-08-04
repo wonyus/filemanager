@@ -25,7 +25,7 @@ use crate::{
     dto::transfer::{CollisionPolicy, TransferEndpoint, TransferOperation, TransferStatus},
 };
 
-use super::path_mapping::{collision_path, map_key_to_local};
+use super::path_mapping::{collision_path, map_key_to_local, validate_local_path_length};
 
 pub const MAX_RECURSIVE_ITEMS: usize = 100_000;
 
@@ -707,6 +707,7 @@ fn normalize_local_identity(path: &Path) -> String {
 }
 
 fn ensure_local_descendant(root: &Path, candidate: &Path) -> Result<(), AppError> {
+    validate_local_path_length(candidate)?;
     if candidate.strip_prefix(root).is_err() {
         return Err(AppError::Validation(
             "local path escapes the selected root".to_string(),

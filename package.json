@@ -11,6 +11,11 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "format:check": "prettier --check .",
+    "smoke:provider": "node scripts/provider-smoke.mjs --check",
+    "release:validate": "node scripts/validate-release-config.mjs",
+    "release:manifest": "node scripts/generate-update-manifest.mjs",
+    "release:tauri-config": "node scripts/generate-tauri-release-config.mjs",
+    "verify:installer": "node scripts/verify-nsis-package.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

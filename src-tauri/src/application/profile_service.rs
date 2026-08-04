@@ -6,9 +6,10 @@ use std::{
 };
 
 use aws_sdk_s3::presigning::PresigningConfig;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Duration as ChronoDuration, Utc};
 use secrecy::SecretString;
-use tokio::{fs, io::AsyncReadExt};
+use tokio::{fs, io::AsyncReadExt, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{
@@ -38,8 +39,112 @@ use crate::{
         database::Database,
         s3::S3ClientManager,
     },
-    transfer::TransferManager,
+    transfer::{settings::SettingsService, TransferManager},
 };
+
+const MAX_SAFE_IMAGE_PIXELS: u64 = 100_000_000;
+const MAX_IMAGE_HEADER_BYTES: u64 = 1024 * 1024;
+/// A single binary fallback is deliberately much smaller than the aggregate
+/// cache quota so a preview request cannot consume all renderer/app memory.
+const MAX_BINARY_FALLBACK_BYTES: u64 = 32 * 1024 * 1024;
+const PREVIEW_HANDLE_SECONDS: u32 = 900;
+
+struct BinaryPreviewCacheEntry {
+    bytes: Arc<Vec<u8>>,
+    content_type: String,
+    created_at: Instant,
+    last_access_at: Instant,
+}
+
+#[derive(Default)]
+struct BinaryPreviewCache {
+    entries: HashMap<String, BinaryPreviewCacheEntry>,
+    total_bytes: u64,
+}
+
+struct BinaryPreviewRequest<'a> {
+    profile: &'a ConnectionProfile,
+    client: &'a aws_sdk_s3::Client,
+    bucket: &'a str,
+    key: &'a str,
+    preview_kind: PreviewKind,
+    content_type: String,
+    etag: Option<&'a str>,
+    version_id: Option<&'a str>,
+    total_size: Option<u64>,
+}
+
+impl BinaryPreviewCache {
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn prune(&mut self, quota_bytes: u64, max_age: Duration, now: Instant) {
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (now.duration_since(entry.created_at) > max_age).then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.remove(&key);
+        }
+        while self.total_bytes > quota_bytes {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access_at)
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest else { break };
+            self.remove(&key);
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &str,
+        quota_bytes: u64,
+        max_age: Duration,
+        now: Instant,
+    ) -> Option<(Arc<Vec<u8>>, String)> {
+        self.prune(quota_bytes, max_age, now);
+        let entry = self.entries.get_mut(key)?;
+        entry.last_access_at = now;
+        Some((entry.bytes.clone(), entry.content_type.clone()))
+    }
+
+    fn insert(
+        &mut self,
+        key: String,
+        bytes: Vec<u8>,
+        content_type: String,
+        quota_bytes: u64,
+        max_age: Duration,
+        now: Instant,
+    ) {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if quota_bytes == 0 || bytes_len > quota_bytes {
+            return;
+        }
+        self.remove(&key);
+        self.total_bytes = self.total_bytes.saturating_add(bytes_len);
+        self.entries.insert(
+            key,
+            BinaryPreviewCacheEntry {
+                bytes: Arc::new(bytes),
+                content_type,
+                created_at: now,
+                last_access_at: now,
+            },
+        );
+        self.prune(quota_bytes, max_age, now);
+    }
+}
 
 pub struct ProfileService {
     database: Database,
@@ -47,6 +152,8 @@ pub struct ProfileService {
     clients: Arc<S3ClientManager>,
     lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     transfers: Arc<TransferManager>,
+    settings: Arc<SettingsService>,
+    binary_preview_cache: Arc<Mutex<BinaryPreviewCache>>,
 }
 
 impl ProfileService {
@@ -55,6 +162,7 @@ impl ProfileService {
         credentials: Arc<dyn CredentialStore>,
         clients: Arc<S3ClientManager>,
         transfers: Arc<TransferManager>,
+        settings: Arc<SettingsService>,
     ) -> Self {
         Self {
             database,
@@ -62,6 +170,8 @@ impl ProfileService {
             clients,
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             transfers,
+            settings,
+            binary_preview_cache: Arc::new(Mutex::new(BinaryPreviewCache::default())),
         }
     }
 
@@ -1172,40 +1282,65 @@ impl ProfileService {
         };
         let (profile, client, key) = self.object_context(&object_request).await?;
         let head = self.fetch_head(&client, &request.bucket, &key).await?;
-        let content_type = head.content_type().unwrap_or("application/octet-stream");
-        let Some(preview_kind) = preview_kind_for_object(content_type, &key) else {
+        let declared_content_type = head.content_type().unwrap_or("application/octet-stream");
+        let Some(preview_kind) = preview_kind_for_object(declared_content_type, &key) else {
             return Err(AppError::UnsupportedProviderFeature(
                 "preview is unavailable for this content type; use Properties or Download"
                     .to_string(),
             ));
         };
+        // Keep provider metadata separate from inferred display metadata.  A
+        // number of S3-compatible gateways return octet-stream for every
+        // object, so extension inference is used only for preview policy and
+        // the ephemeral result content type.
+        let content_type = effective_preview_content_type(declared_content_type, &key);
         let total_size = head
             .content_length()
             .and_then(|size| u64::try_from(size).ok());
 
-        // Binary media and PDF previews use a short-lived in-memory bearer
-        // URL.  The UI clears this handle when the selected object changes;
-        // it is never persisted or sent to diagnostics/history.
+        // Binary media and PDF previews prefer a short-lived in-memory bearer
+        // URL.  Image dimensions are checked before handing a remote URL to
+        // the renderer so a decompression bomb cannot make the browser decode
+        // more than the 100 megapixel safety budget.
         if !matches!(preview_kind, PreviewKind::Text) {
-            self.ensure_presigned_get_supported(&profile).await?;
-            let expires_in_seconds = 900_u32;
-            let (url, expires_at) = self
-                .presigned_get(&client, &request.bucket, &key, expires_in_seconds)
-                .await?;
-            return Ok(PreviewResult {
-                schema_version: METADATA_SCHEMA_VERSION,
-                profile_id: profile.id.to_string(),
-                bucket: request.bucket,
-                key,
-                preview_kind,
-                content_type: content_type.to_string(),
-                text: String::new(),
-                url: Some(url),
-                expires_at: Some(expires_at),
-                bytes_read: 0,
-                total_size,
-                truncated: false,
-            });
+            if matches!(preview_kind, PreviewKind::Image) {
+                self.validate_image_dimensions(&client, &request.bucket, &key, &content_type)
+                    .await?;
+            }
+            let (presign_supported, _) = self.share_capability(&profile).await?;
+            if presign_supported {
+                let (url, expires_at) = self
+                    .presigned_get(&client, &request.bucket, &key, PREVIEW_HANDLE_SECONDS)
+                    .await?;
+                return Ok(PreviewResult {
+                    schema_version: METADATA_SCHEMA_VERSION,
+                    profile_id: profile.id.to_string(),
+                    bucket: request.bucket,
+                    key,
+                    preview_kind,
+                    content_type,
+                    text: String::new(),
+                    url: Some(url),
+                    data_url: None,
+                    expires_at: Some(expires_at),
+                    bytes_read: 0,
+                    total_size,
+                    truncated: false,
+                });
+            }
+            return self
+                .binary_preview_fallback(BinaryPreviewRequest {
+                    profile: &profile,
+                    client: &client,
+                    bucket: &request.bucket,
+                    key: &key,
+                    preview_kind,
+                    content_type,
+                    etag: head.e_tag(),
+                    version_id: head.version_id(),
+                    total_size,
+                })
+                .await;
         }
         let max_bytes = request
             .max_bytes
@@ -1245,14 +1380,166 @@ impl ProfileService {
             bucket: request.bucket,
             key,
             preview_kind,
-            content_type: content_type.to_string(),
+            content_type,
             text,
             url: None,
+            data_url: None,
             expires_at: None,
             bytes_read: u32::try_from(bytes.len()).unwrap_or(max_bytes),
             total_size,
             truncated,
         })
+    }
+
+    async fn validate_image_dimensions(
+        &self,
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+    ) -> Result<(), AppError> {
+        let bytes = self
+            .read_bounded_object(
+                client,
+                bucket,
+                key,
+                MAX_IMAGE_HEADER_BYTES,
+                Some(MAX_IMAGE_HEADER_BYTES),
+            )
+            .await?;
+        let Some((width, height)) = image_dimensions(&bytes, content_type) else {
+            return Err(AppError::UnsupportedProviderFeature(
+                "image dimensions could not be verified safely; use Download instead".to_string(),
+            ));
+        };
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| {
+                AppError::UnsupportedProviderFeature(
+                    "image dimensions exceed the safe preview limit".to_string(),
+                )
+            })?;
+        if pixels > MAX_SAFE_IMAGE_PIXELS {
+            return Err(AppError::UnsupportedProviderFeature(format!(
+                "image is too large to preview safely ({width}×{height}; maximum is 100 megapixels)"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn binary_preview_fallback(
+        &self,
+        request: BinaryPreviewRequest<'_>,
+    ) -> Result<PreviewResult, AppError> {
+        let BinaryPreviewRequest {
+            profile,
+            client,
+            bucket,
+            key,
+            preview_kind,
+            content_type,
+            etag,
+            version_id,
+            total_size,
+        } = request;
+        let settings = self.settings.get().await;
+        let quota_bytes = settings.preview_cache_bytes;
+        let per_object_limit = quota_bytes.min(MAX_BINARY_FALLBACK_BYTES);
+        if per_object_limit == 0 {
+            return Err(AppError::UnsupportedProviderFeature(
+                "binary preview cache is disabled; use Download instead".to_string(),
+            ));
+        }
+        if total_size.is_some_and(|size| size > per_object_limit) {
+            return Err(AppError::UnsupportedProviderFeature(format!(
+                "binary object exceeds the bounded preview fallback ({per_object_limit} bytes); use Download instead"
+            )));
+        }
+        let max_age = Duration::from_secs(
+            u64::from(settings.preview_cache_max_age_hours).saturating_mul(60 * 60),
+        );
+        let cache_key = format!(
+            "{}\u{1f}{bucket}\u{1f}{key}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{content_type}",
+            profile.id,
+            etag.unwrap_or_default(),
+            version_id.unwrap_or_default(),
+            total_size.unwrap_or_default(),
+        );
+        let now = Instant::now();
+        let cached =
+            self.binary_preview_cache
+                .lock()
+                .await
+                .get(&cache_key, quota_bytes, max_age, now);
+        let bytes = if let Some((bytes, _cached_content_type)) = cached {
+            bytes
+        } else {
+            let bytes = self
+                .read_bounded_object(client, bucket, key, per_object_limit, None)
+                .await?;
+            self.binary_preview_cache.lock().await.insert(
+                cache_key,
+                bytes.clone(),
+                content_type.clone(),
+                quota_bytes,
+                max_age,
+                now,
+            );
+            Arc::new(bytes)
+        };
+        let data_url = format!(
+            "data:{};base64,{}",
+            safe_data_url_content_type(&content_type),
+            BASE64.encode(bytes.as_ref()),
+        );
+        let expires_at =
+            (Utc::now() + ChronoDuration::seconds(i64::from(PREVIEW_HANDLE_SECONDS))).to_rfc3339();
+        Ok(PreviewResult {
+            schema_version: METADATA_SCHEMA_VERSION,
+            profile_id: profile.id.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            preview_kind,
+            content_type,
+            text: String::new(),
+            url: None,
+            data_url: Some(data_url),
+            expires_at: Some(expires_at),
+            bytes_read: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            total_size: total_size.or_else(|| u64::try_from(bytes.len()).ok()),
+            truncated: false,
+        })
+    }
+
+    async fn read_bounded_object(
+        &self,
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        max_bytes: u64,
+        range_limit: Option<u64>,
+    ) -> Result<Vec<u8>, AppError> {
+        let mut operation = client.get_object().bucket(bucket).key(key);
+        if let Some(limit) = range_limit {
+            operation = operation.range(format!("bytes=0-{}", limit.saturating_sub(1)));
+        }
+        let output = operation
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_message(&error)))?;
+        let mut stream = output
+            .body
+            .into_async_read()
+            .take(max_bytes.saturating_add(1));
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(max_bytes.min(1024 * 1024)).unwrap_or(0));
+        stream.read_to_end(&mut bytes).await.map_err(AppError::Io)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(AppError::UnsupportedProviderFeature(format!(
+                "binary preview exceeds the bounded {max_bytes}-byte cache limit; use Download instead"
+            )));
+        }
+        Ok(bytes)
     }
 
     /// Create a short-lived GET URL.  The object is headed first so callers
@@ -1593,40 +1880,223 @@ fn preview_kind_for_object(content_type: &str, key: &str) -> Option<PreviewKind>
         if !media_type.is_empty() && media_type != "application/octet-stream" {
             return None;
         }
-        let extension = key
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.'))
-            .map(|(_, extension)| extension.to_ascii_lowercase());
-        extension.as_deref().and_then(|extension| {
-            matches!(
-                extension,
-                "txt"
-                    | "log"
-                    | "json"
-                    | "jsonl"
-                    | "xml"
-                    | "md"
-                    | "markdown"
-                    | "csv"
-                    | "yaml"
-                    | "yml"
-                    | "toml"
-                    | "ini"
-                    | "conf"
-                    | "cfg"
-                    | "properties"
-                    | "env"
-                    | "rs"
-                    | "ts"
-                    | "tsx"
-                    | "js"
-                    | "jsx"
-                    | "css"
-            )
-            .then_some(PreviewKind::Text)
-        })
+        preview_kind_for_content_type(infer_content_type_for_key(key).unwrap_or_default())
     })
+}
+
+fn infer_content_type_for_key(key: &str) -> Option<&'static str> {
+    let extension = key
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    match extension.as_deref()? {
+        "txt" | "log" | "conf" | "cfg" | "properties" | "env" => Some("text/plain"),
+        "json" | "jsonl" => Some("application/json"),
+        "xml" => Some("application/xml"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "yaml" | "yml" => Some("application/yaml"),
+        "toml" => Some("application/toml"),
+        "rs" | "ts" | "tsx" | "js" | "jsx" => Some("text/plain"),
+        "css" => Some("text/css"),
+        "html" | "htm" => Some("text/html"),
+        "svg" => Some("image/svg+xml"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+fn effective_preview_content_type(content_type: &str, key: &str) -> String {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    if !media_type.is_empty() && !media_type.eq_ignore_ascii_case("application/octet-stream") {
+        return media_type.to_ascii_lowercase();
+    }
+    infer_content_type_for_key(key)
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn safe_data_url_content_type(content_type: &str) -> String {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        media_type.as_str(),
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "audio/mpeg"
+            | "audio/wav"
+            | "audio/ogg"
+            | "video/mp4"
+            | "video/webm"
+            | "application/pdf"
+    ) {
+        media_type
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn image_dimensions(bytes: &[u8], content_type: &str) -> Option<(u32, u32)> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "image/png" => png_dimensions(bytes),
+        "image/jpeg" => jpeg_dimensions(bytes),
+        "image/gif" => gif_dimensions(bytes),
+        "image/webp" => webp_dimensions(bytes),
+        "image/bmp" => bmp_dimensions(bytes),
+        _ => None,
+    }
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 10 || (!bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let width = u32::from(u16::from_le_bytes(bytes[6..8].try_into().ok()?));
+    let height = u32::from(u16::from_le_bytes(bytes[8..10].try_into().ok()?));
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn bmp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 26 || &bytes[0..2] != b"BM" {
+        return None;
+    }
+    let width = i32::from_le_bytes(bytes[18..22].try_into().ok()?);
+    let height = i32::from_le_bytes(bytes[22..26].try_into().ok()?);
+    let width = width.unsigned_abs();
+    let height = height.unsigned_abs();
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || &bytes[0..2] != b"\xff\xd8" {
+        return None;
+    }
+    let mut offset = 2_usize;
+    while offset + 1 < bytes.len() {
+        if bytes[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset + 1)?,
+        ]));
+        if length < 2 || offset + length > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if length < 7 {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]));
+            let width = u32::from(u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]));
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        offset += length;
+    }
+    None
+}
+
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 16 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut offset = 12_usize;
+    while offset + 8 <= bytes.len() {
+        let chunk = &bytes[offset..offset + 4];
+        let size = usize::try_from(u32::from_le_bytes(
+            bytes[offset + 4..offset + 8].try_into().ok()?,
+        ))
+        .ok()?;
+        let data_start = offset + 8;
+        let data_end = data_start.checked_add(size)?;
+        if data_end > bytes.len() {
+            return None;
+        }
+        let data = &bytes[data_start..data_end];
+        if chunk == b"VP8X" && data.len() >= 10 {
+            let width =
+                1 + u32::from(data[4]) + (u32::from(data[5]) << 8) + (u32::from(data[6]) << 16);
+            let height =
+                1 + u32::from(data[7]) + (u32::from(data[8]) << 8) + (u32::from(data[9]) << 16);
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        if chunk == b"VP8 " && data.len() >= 10 && data[3..6] == [0x9d, 0x01, 0x2a] {
+            let width = u32::from(u16::from_le_bytes([data[6], data[7]]) & 0x3fff);
+            let height = u32::from(u16::from_le_bytes([data[8], data[9]]) & 0x3fff);
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        if chunk == b"VP8L" && data.len() >= 5 && data[0] == 0x2f {
+            let bits = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            let width = 1 + (bits & 0x3fff);
+            let height = 1 + ((bits >> 14) & 0x3fff);
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        offset = data_end + (size & 1);
+    }
+    None
 }
 
 fn normalize_share_expiry(value: Option<u32>) -> u32 {
@@ -2219,7 +2689,62 @@ mod tests {
             preview_kind_for_object("application/octet-stream", "logs/app.log"),
             Some(PreviewKind::Text)
         ));
-        assert!(preview_kind_for_object("application/octet-stream", "web/index.html").is_none());
+        assert!(matches!(
+            preview_kind_for_object("application/octet-stream", "web/index.html"),
+            Some(PreviewKind::Text)
+        ));
+        assert!(matches!(
+            preview_kind_for_object("application/octet-stream", "images/photo.png"),
+            Some(PreviewKind::Image)
+        ));
+        assert_eq!(
+            effective_preview_content_type("application/octet-stream", "images/photo.png"),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn image_dimension_guard_parses_allowlisted_headers() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend_from_slice(&4_u32.to_be_bytes());
+        png.extend_from_slice(&3_u32.to_be_bytes());
+        assert_eq!(image_dimensions(&png, "image/png"), Some((4, 3)));
+
+        let gif = b"GIF89a\x10\0\x08\0";
+        assert_eq!(image_dimensions(gif, "image/gif"), Some((16, 8)));
+
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(26, 0);
+        bmp[18..22].copy_from_slice(&1_i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&2_i32.to_le_bytes());
+        assert_eq!(image_dimensions(&bmp, "image/bmp"), Some((1, 2)));
+    }
+
+    #[test]
+    fn image_dimension_guard_rejects_unknown_or_oversized_headers() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend_from_slice(&10_001_u32.to_be_bytes());
+        png.extend_from_slice(&10_001_u32.to_be_bytes());
+        let (width, height) = image_dimensions(&png, "image/png").unwrap();
+        assert!(u64::from(width) * u64::from(height) > MAX_SAFE_IMAGE_PIXELS);
+        assert!(image_dimensions(b"not an image", "image/png").is_none());
+    }
+
+    #[test]
+    fn data_url_content_type_is_header_safe() {
+        assert_eq!(safe_data_url_content_type("image/png"), "image/png");
+        assert_eq!(
+            safe_data_url_content_type("image/png; charset=utf-8"),
+            "image/png"
+        );
+        assert_eq!(
+            safe_data_url_content_type("text/plain\r\ndata:evil"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            safe_data_url_content_type("application/javascript"),
+            "application/octet-stream"
+        );
     }
 
     #[test]

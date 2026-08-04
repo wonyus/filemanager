@@ -115,6 +115,11 @@ pub struct PreviewResult {
     pub content_type: String,
     pub text: String,
     pub url: Option<String>,
+    /// A bounded, in-memory cache fallback for providers that cannot create
+    /// presigned GET URLs.  This is an ephemeral data URL; it is never
+    /// persisted in diagnostics/history and is cleared by the renderer when
+    /// the preview is closed.
+    pub data_url: Option<String>,
     pub expires_at: Option<String>,
     pub bytes_read: u32,
     pub total_size: Option<u64>,

@@ -24,6 +24,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build
+      - run: pnpm smoke:provider
+      - run: pnpm release:validate
 
   rust:
     runs-on: ubuntu-latest
@@ -63,3 +65,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
       - run: pnpm tauri build --bundles nsis
+      - run: pnpm verify:installer -- --required

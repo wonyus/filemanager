@@ -56,6 +56,7 @@ use crate::{
         s3::S3ClientManager,
     },
     transfer::{
+        path_mapping::{map_key_to_local, validate_local_path_length},
         recursive::{
             execute_recursive, plan_download_prefix, plan_remote_prefix,
             plan_upload_directory_with_options, write_mapping_manifest, CancellationFlag,
@@ -259,7 +260,7 @@ impl TransferService {
                     }
                     retry_number = retry_number.saturating_add(1);
                     let _ = self.manager.transition(id, TransferStatus::Retrying).await;
-                    let delay = policy.delay_for_retry(retry_number - 1);
+                    let delay = policy.jittered_delay_for_retry(retry_number - 1);
                     tokio::time::sleep(delay).await;
                     if self.manager.is_cancel_requested(id).await {
                         return Err(AppError::TransferStateConflict(
@@ -354,10 +355,10 @@ impl TransferService {
                 .bucket(&bucket)
                 .key(&key)
                 .content_length(size as i64);
+            if let Some(value) = upload_content_type(&source, request.metadata.as_ref()) {
+                upload = upload.content_type(value);
+            }
             if let Some(metadata) = request.metadata.as_ref() {
-                if let Some(value) = metadata.content_type.as_deref() {
-                    upload = upload.content_type(value);
-                }
                 if let Some(value) = metadata.content_disposition.as_deref() {
                     upload = upload.content_disposition(value);
                 }
@@ -449,10 +450,10 @@ impl TransferService {
             ));
         }
         let mut upload_builder = client.create_multipart_upload().bucket(bucket).key(key);
+        if let Some(value) = upload_content_type(source, metadata) {
+            upload_builder = upload_builder.content_type(value);
+        }
         if let Some(metadata) = metadata {
-            if let Some(value) = metadata.content_type.as_deref() {
-                upload_builder = upload_builder.content_type(value);
-            }
             if let Some(value) = metadata.content_disposition.as_deref() {
                 upload_builder = upload_builder.content_disposition(value);
             }
@@ -645,6 +646,19 @@ impl TransferService {
         let mut destination = local_path(request.destination.as_ref().ok_or_else(|| {
             AppError::Validation("download destination is required".to_string())
         })?)?;
+        // A directory picked for a multi-selection download is resolved to a
+        // deterministic, sanitized leaf before collision handling. A
+        // Save-file picker returns a non-directory path and keeps its explicit
+        // user-selected filename unchanged.
+        if destination.is_dir() {
+            let leaf = key
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::Validation("object key has no file name".to_string()))?;
+            destination = map_key_to_local(&destination, "", leaf)?;
+        }
         if destination.exists() && request.collision_policy != CollisionPolicy::Replace {
             if request.collision_policy == CollisionPolicy::Skip {
                 return Ok(ExecutionOutcome::completed(0, 1));
@@ -699,6 +713,13 @@ impl TransferService {
                 let _ = fs::remove_file(&partial).await;
                 let _ = fs::remove_file(&partial_metadata).await;
             }
+        }
+        if let Some(total) = total {
+            let required = total.saturating_sub(offset);
+            check_available_disk_space(
+                destination.parent().unwrap_or_else(|| Path::new(".")),
+                required,
+            )?;
         }
         let resume_metadata = DownloadResumeMetadata {
             bucket: bucket.clone(),
@@ -1874,10 +1895,10 @@ impl S3RecursiveExecutor {
             .bucket(bucket)
             .key(key)
             .content_length(size as i64);
+        if let Some(value) = upload_content_type(Path::new(path), self.metadata.as_ref()) {
+            upload = upload.content_type(value);
+        }
         if let Some(metadata) = self.metadata.as_ref() {
-            if let Some(value) = metadata.content_type.as_deref() {
-                upload = upload.content_type(value);
-            }
             if let Some(value) = metadata.content_disposition.as_deref() {
                 upload = upload.content_disposition(value);
             }
@@ -1921,10 +1942,10 @@ impl S3RecursiveExecutor {
             .create_multipart_upload()
             .bucket(bucket)
             .key(key);
+        if let Some(value) = upload_content_type(Path::new(path), metadata) {
+            upload_builder = upload_builder.content_type(value);
+        }
         if let Some(metadata) = metadata {
-            if let Some(value) = metadata.content_type.as_deref() {
-                upload_builder = upload_builder.content_type(value);
-            }
             if let Some(value) = metadata.content_disposition.as_deref() {
                 upload_builder = upload_builder.content_disposition(value);
             }
@@ -2467,6 +2488,7 @@ fn authorize_request(request: &StartTransferRequest) -> Result<(), AppError> {
                 {
                     return Err(AppError::Validation("local path is unsafe".to_string()));
                 }
+                validate_local_path_length(Path::new(path))?;
             }
             TransferEndpoint::Remote { bucket, key, .. } => {
                 if !valid_bucket_name(bucket)
@@ -2534,7 +2556,16 @@ fn local_path(endpoint: &TransferEndpoint) -> Result<PathBuf, AppError> {
     {
         return Err(AppError::Validation("local path is invalid".to_string()));
     }
+    validate_local_path_length(Path::new(path))?;
     Ok(PathBuf::from(path))
+}
+
+fn check_available_disk_space(directory: &Path, required_bytes: u64) -> Result<(), AppError> {
+    let available = fs2::available_space(directory).map_err(AppError::Io)?;
+    if available < required_bytes {
+        return Err(AppError::LocalDiskFull);
+    }
+    Ok(())
 }
 
 fn is_absolute_local_path(value: &str) -> bool {
@@ -2774,6 +2805,44 @@ fn user_metadata_matches(
     }
 }
 
+/// Infer a conservative HTTP Content-Type when the caller did not provide
+/// one explicitly. Explicit metadata always wins; unknown extensions are left
+/// to the provider's default rather than guessing an active type.
+fn upload_content_type(path: &Path, metadata: Option<&UploadMetadata>) -> Option<String> {
+    metadata
+        .and_then(|value| value.content_type.clone())
+        .or_else(|| infer_upload_content_type(path).map(ToString::to_string))
+}
+
+fn infer_upload_content_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "txt" | "log" | "conf" | "cfg" | "properties" | "env" => Some("text/plain"),
+        "json" | "jsonl" => Some("application/json"),
+        "xml" => Some("application/xml"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "yaml" | "yml" => Some("application/yaml"),
+        "toml" => Some("application/toml"),
+        "html" | "htm" => Some("text/html"),
+        "css" => Some("text/css"),
+        "js" | "jsx" | "ts" | "tsx" => Some("text/javascript"),
+        "svg" => Some("image/svg+xml"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
 fn safe_provider_error(error: &impl std::fmt::Display) -> String {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
@@ -2847,5 +2916,32 @@ mod tests {
         assert_eq!(ranges[1], (2, part_bytes, part_bytes * 2 - 1));
         assert_eq!(ranges[2], (3, part_bytes * 2, part_bytes * 2 + 6));
         assert!(multipart_copy_ranges(part_bytes * 10_001).is_err());
+    }
+
+    #[test]
+    fn upload_content_type_infers_safe_common_extensions() {
+        assert_eq!(
+            upload_content_type(Path::new("photo.PNG"), None).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            upload_content_type(Path::new("notes.md"), None).as_deref(),
+            Some("text/markdown")
+        );
+        assert_eq!(upload_content_type(Path::new("archive.bin"), None), None);
+    }
+
+    #[test]
+    fn explicit_upload_content_type_overrides_extension_inference() {
+        let metadata = UploadMetadata {
+            content_type: Some("application/x-custom".to_string()),
+            content_disposition: None,
+            cache_control: None,
+            user_metadata: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(
+            upload_content_type(Path::new("photo.png"), Some(&metadata)).as_deref(),
+            Some("application/x-custom")
+        );
     }
 }

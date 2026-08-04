@@ -28,6 +28,7 @@ pub enum AppErrorCode {
     RateLimited,
     ProviderUnavailable,
     LocalPathInvalid,
+    LocalPathTooLong,
     LocalPermissionDenied,
     LocalDiskFull,
     LocalFileChanged,
@@ -72,6 +73,8 @@ pub enum AppError {
     RequestTimedOut,
     #[error("local permission denied")]
     LocalPermissionDenied,
+    #[error("local path is too long")]
+    LocalPathTooLong,
     #[error("local disk is full")]
     LocalDiskFull,
     #[error("local file changed during transfer")]
@@ -236,6 +239,11 @@ impl From<AppError> for PublicError {
                 AppErrorCode::LocalPermissionDenied,
                 false,
                 "Permission was denied for the local path.".to_string(),
+            ),
+            AppError::LocalPathTooLong => (
+                AppErrorCode::LocalPathTooLong,
+                false,
+                "The local destination path is too long.".to_string(),
             ),
             AppError::LocalDiskFull => (
                 AppErrorCode::LocalDiskFull,

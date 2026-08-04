@@ -5,6 +5,14 @@ use sha2::{Digest, Sha256};
 use crate::domain::error::AppError;
 
 const MAX_SEGMENT_BYTES: usize = 255;
+pub const MAX_LOCAL_PATH_UTF16_UNITS: usize = 30_000;
+
+pub fn validate_local_path_length(path: &Path) -> Result<(), AppError> {
+    if path.to_string_lossy().encode_utf16().count() > MAX_LOCAL_PATH_UTF16_UNITS {
+        return Err(AppError::LocalPathTooLong);
+    }
+    Ok(())
+}
 
 /// Maps an object key relative to a selected prefix into a safe local path.
 /// The mapping is lexical (it does not require the destination to exist) and
@@ -31,6 +39,7 @@ pub fn map_key_to_local(
             "object key has no downloadable name".to_string(),
         ));
     }
+    validate_local_path_length(&output)?;
     Ok(output)
 }
 
@@ -193,5 +202,18 @@ mod tests {
         assert!(path.to_string_lossy().contains("a_s3x3A_b.txt"));
         let path = map_key_to_local(Path::new("C:/downloads"), "", "x_s3x3A_y").unwrap();
         assert!(path.to_string_lossy().contains("x_s3x5F_s3x3A_y"));
+    }
+
+    #[test]
+    fn rejects_paths_over_the_windows_safety_limit() {
+        let root = PathBuf::from("C:/downloads");
+        let key = std::iter::repeat("a")
+            .take(MAX_LOCAL_PATH_UTF16_UNITS)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(matches!(
+            map_key_to_local(&root, "", &key),
+            Err(AppError::LocalPathTooLong)
+        ));
     }
 }

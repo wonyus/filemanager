@@ -57,6 +57,17 @@ pub async fn check_for_updates(
         UpdateChannel::Stable => "stable",
         UpdateChannel::Beta => "beta",
     };
+    let active_transfers = state.transfers.active_count().await;
+    if active_transfers > 0 {
+        return Ok(UpdateCheckResult {
+            schema_version: 1,
+            channel: channel.to_string(),
+            available: false,
+            message: format!(
+                "Update checks are deferred while {active_transfers} transfer(s) are active."
+            ),
+        });
+    }
     // Network update checks are intentionally conservative until a signed
     // manifest endpoint is configured for the selected channel.  Returning a
     // typed result keeps the UI explicit instead of following arbitrary URLs.

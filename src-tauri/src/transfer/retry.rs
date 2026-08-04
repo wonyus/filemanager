@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::domain::error::{is_credential_expired_message, AppError};
 
@@ -55,6 +55,28 @@ impl RetryPolicy {
         Duration::from_millis(capped.min(u128::from(u64::MAX)) as u64)
     }
 
+    /// Full jitter for provider retries.  A retry waits for a uniformly
+    /// distributed duration between zero and the deterministic exponential
+    /// cap, which prevents a fleet of clients from retrying in lockstep.
+    /// Backoff does not protect a secret, so a lightweight per-call entropy
+    /// mix is sufficient and avoids adding a renderer-visible RNG surface.
+    pub fn jittered_delay_for_retry(&self, retry_number: u32) -> Duration {
+        let cap = self.delay_for_retry(retry_number).as_millis();
+        if cap <= 1 {
+            return Duration::from_millis(cap as u64);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let nanos = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+        let mut state = nanos ^ u64::from(retry_number).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let cap = u64::try_from(cap).unwrap_or(u64::MAX);
+        Duration::from_millis(state % cap.saturating_add(1))
+    }
+
     pub fn should_retry(&self, retry_number: u32, class: RetryClass) -> bool {
         class == RetryClass::Retryable && retry_number < self.retry_limit
     }
@@ -83,6 +105,7 @@ pub fn classify_error(error: &AppError) -> RetryClass {
         | AppError::ObjectNotFound
         | AppError::BucketAccessDenied
         | AppError::LocalPermissionDenied
+        | AppError::LocalPathTooLong
         | AppError::LocalDiskFull
         | AppError::LocalFileChanged => RetryClass::NonRetryable,
         AppError::NetworkUnavailable | AppError::RequestTimedOut => RetryClass::Retryable,
@@ -155,6 +178,7 @@ mod tests {
         assert_eq!(policy.delay_for_retry(3), Duration::from_secs(3));
         assert!(policy.should_retry(4, RetryClass::Retryable));
         assert!(!policy.should_retry(5, RetryClass::Retryable));
+        assert!(policy.jittered_delay_for_retry(3) <= Duration::from_secs(3));
     }
 
     #[test]

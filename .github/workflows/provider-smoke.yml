@@ -1,0 +1,50 @@
+name: Provider smoke tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider preset to exercise
+        required: true
+        type: choice
+        options:
+          - awsS3
+          - cloudflareR2
+          - minio
+      write_probe:
+        description: Run the isolated Put/Get/Delete probe as well as read checks
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    environment: provider-smoke
+    env:
+      S3FM_SMOKE_PROVIDER: ${{ inputs.provider }}
+      S3FM_SMOKE_REGION: ${{ secrets.S3FM_SMOKE_REGION }}
+      S3FM_SMOKE_ENDPOINT: ${{ secrets.S3FM_SMOKE_ENDPOINT }}
+      S3FM_SMOKE_BUCKET: ${{ secrets.S3FM_SMOKE_BUCKET }}
+      S3FM_SMOKE_ACCESS_KEY_ID: ${{ secrets.S3FM_SMOKE_ACCESS_KEY_ID }}
+      S3FM_SMOKE_SECRET_ACCESS_KEY: ${{ secrets.S3FM_SMOKE_SECRET_ACCESS_KEY }}
+      S3FM_SMOKE_SESSION_TOKEN: ${{ secrets.S3FM_SMOKE_SESSION_TOKEN }}
+      S3FM_SMOKE_ALLOW_INSECURE_HTTP: ${{ secrets.S3FM_SMOKE_ALLOW_INSECURE_HTTP }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate smoke configuration
+        run: node scripts/provider-smoke.mjs --check
+      - name: Run read-only smoke checks
+        if: ${{ !inputs.write_probe }}
+        run: node scripts/provider-smoke.mjs --run
+      - name: Run isolated write smoke probe
+        if: ${{ inputs.write_probe }}
+        env:
+          S3FM_SMOKE_ALLOW_WRITE: ${{ secrets.S3FM_SMOKE_ALLOW_WRITE }}
+        run: node scripts/provider-smoke.mjs --run --write
