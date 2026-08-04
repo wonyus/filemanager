@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{config::Credentials, Client};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::{
     domain::{error::AppError, profile::ConnectionProfile, provider::AddressingStyle},
@@ -12,9 +12,59 @@ use crate::{
 #[derive(Default)]
 pub struct S3ClientManager {
     clients: RwLock<HashMap<String, Arc<Client>>>,
+    request_limiters: RwLock<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl S3ClientManager {
+    /// Configure the per-profile request budget captured for a newly created
+    /// transfer. Existing permits are adjusted conservatively; in-flight
+    /// requests are never revoked.
+    pub async fn configure_request_limit(&self, profile_id: &str, limit: u8) {
+        let limit = usize::from(limit.clamp(1, 32));
+        let mut limiters = self.request_limiters.write().await;
+        if let Some(semaphore) = limiters.get(profile_id) {
+            let available = semaphore.available_permits();
+            if available < limit {
+                semaphore.add_permits(limit - available);
+            } else if available > limit {
+                semaphore.forget_permits(available - limit);
+            }
+        } else {
+            limiters.insert(profile_id.to_string(), Arc::new(Semaphore::new(limit)));
+        }
+    }
+
+    /// Acquire one permit for a provider request belonging to a profile.
+    /// Callers hold the guard for the lifetime of the SDK future.
+    pub async fn acquire_request(
+        &self,
+        profile_id: &str,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
+        self.acquire_requests(profile_id, 1).await
+    }
+
+    /// Reserve the maximum number of provider requests a transfer can issue
+    /// concurrently.  Multipart workers hold one permit each, so reserving
+    /// the per-job width prevents several jobs for the same profile from
+    /// collectively exceeding the profile request budget.
+    pub async fn acquire_requests(
+        &self,
+        profile_id: &str,
+        permits: usize,
+    ) -> Result<OwnedSemaphorePermit, AppError> {
+        let semaphore = {
+            let mut limiters = self.request_limiters.write().await;
+            limiters
+                .entry(profile_id.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(8)))
+                .clone()
+        };
+        let permits = permits.clamp(1, 32) as u32;
+        semaphore.acquire_many_owned(permits).await.map_err(|_| {
+            AppError::TransferStateConflict("profile request limiter is unavailable".to_string())
+        })
+    }
+
     pub async fn get_or_create(
         &self,
         profile: &ConnectionProfile,
@@ -83,6 +133,10 @@ impl S3ClientManager {
             .write()
             .await
             .retain(|key, _| !key.starts_with(&profile_id.to_string()));
+        self.request_limiters
+            .write()
+            .await
+            .remove(&profile_id.to_string());
     }
 }
 

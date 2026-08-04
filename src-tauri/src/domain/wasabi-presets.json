@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "regions": {
+    "us-east-1": "https://s3.wasabisys.com",
+    "us-east-2": "https://s3.us-east-2.wasabisys.com",
+    "eu-central-1": "https://s3.eu-central-1.wasabisys.com",
+    "ap-northeast-1": "https://s3.ap-northeast-1.wasabisys.com",
+    "ap-southeast-1": "https://s3.ap-southeast-1.wasabisys.com"
+  }
+}

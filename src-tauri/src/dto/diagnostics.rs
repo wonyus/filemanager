@@ -100,4 +100,32 @@ pub struct UpdateCheckResult {
     pub channel: String,
     pub available: bool,
     pub message: String,
+    /// Version announced by the verified manifest, when one is available.
+    pub version: Option<String>,
+    /// Release notes are supplied by the signed manifest and are never used
+    /// as executable content.
+    pub notes: Option<String>,
+    pub published_at: Option<String>,
+    /// Installation is always an explicit, user-confirmed action.  The
+    /// backend never installs as part of a check.
+    pub install_requires_confirmation: bool,
+    pub can_install: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallUpdateRequest {
+    pub schema_version: u16,
+    pub expected_version: String,
+    /// Exact confirmation phrase shown by the UI, e.g. `INSTALL UPDATE 1.2.3`.
+    pub confirmation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallUpdateResult {
+    pub schema_version: u16,
+    pub installed: bool,
+    pub version: String,
+    pub message: String,
 }

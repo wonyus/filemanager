@@ -166,6 +166,14 @@ interface AppStore {
   saving: boolean;
   testing: boolean;
   error: string | null;
+  /**
+   * Explorer-specific errors are kept separate from the global command error
+   * so a failed transfer/profile action cannot make a healthy listing look
+   * empty.  The UI uses these fields to offer a targeted retry and to label
+   * stale/partial pages accurately.
+   */
+  listingError: string | null;
+  bucketError: string | null;
   testResult: ConnectionTestResult | null;
   listingGeneration: number;
   profileSelectionGeneration: number;
@@ -192,6 +200,8 @@ interface AppStore {
   clearPreview: () => void;
   clearShare: () => void;
   clearInspector: () => void;
+  clearListingError: () => void;
+  clearBucketError: () => void;
   refreshTransfers: () => Promise<TransferHistoryPage | null>;
   startTransfer: (request: StartTransferRequest) => Promise<TransferJob | null>;
   pauseTransfer: (id: string) => Promise<void>;
@@ -226,6 +236,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   saving: false,
   testing: false,
   error: null,
+  listingError: null,
+  bucketError: null,
   testResult: null,
   listingGeneration: 0,
   profileSelectionGeneration: 0,
@@ -256,6 +268,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       buckets: [],
       listing: null,
       location: null,
+      listingError: null,
+      bucketError: null,
       metadata: null,
       preview: null,
       shareLink: null,
@@ -367,6 +381,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       metadata: null,
       preview: null,
       shareLink: null,
+      listingError: null,
       inspectorGeneration,
       error: null,
     });
@@ -375,21 +390,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   listBuckets: async (profileId) => {
     const requestGeneration = get().profileSelectionGeneration;
-    set({ loading: true, error: null });
+    set({ loading: true, error: null, bucketError: null });
     try {
       const buckets = await commands.listBuckets(profileId);
       if (
         get().profileSelectionGeneration === requestGeneration &&
         get().selectedProfileId === profileId
       ) {
-        set({ buckets, loading: false });
+        set({ buckets, loading: false, bucketError: null });
       }
     } catch (error) {
       if (
         get().profileSelectionGeneration === requestGeneration &&
         get().selectedProfileId === profileId
       ) {
-        set({ loading: false, error: formatCommandError(error) });
+        const message = formatCommandError(error);
+        set({ loading: false, error: message, bucketError: message });
       }
     }
   },
@@ -400,6 +416,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({
       loading: true,
       error: null,
+      listingError: null,
       location,
       metadata: null,
       preview: null,
@@ -422,11 +439,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
         get().location?.bucket === location.bucket &&
         get().location?.prefix === location.prefix
       ) {
-        set({ listing, loading: false });
+        set({ listing, loading: false, listingError: null });
       }
     } catch (error) {
       if (get().listingGeneration === requestGeneration) {
-        set({ loading: false, error: formatCommandError(error) });
+        const message = formatCommandError(error);
+        set({ loading: false, error: message, listingError: message });
       }
     }
   },
@@ -528,6 +546,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
       shareLink: null,
       inspectorGeneration: state.inspectorGeneration + 1,
     })),
+
+  clearListingError: () => set({ listingError: null }),
+
+  clearBucketError: () => set({ bucketError: null }),
 
   refreshTransfers: async () => {
     set({ transferLoading: true, error: null });

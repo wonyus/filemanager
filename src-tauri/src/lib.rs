@@ -30,6 +30,9 @@ pub fn run() {
             tauri::async_runtime::block_on(state.transfers.recover_from_database())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+            #[cfg(feature = "updater")]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -71,6 +74,7 @@ pub fn run() {
             commands::diagnostics::export_diagnostics,
             commands::diagnostics::clear_logs,
             commands::diagnostics::check_for_updates,
+            commands::diagnostics::install_update,
             commands::system::pick_file,
             commands::system::pick_directory,
             commands::system::pick_save_file,

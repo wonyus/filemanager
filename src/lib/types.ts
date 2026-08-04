@@ -52,7 +52,9 @@ export interface StartTransferRequest {
   totalBytes?: number;
   totalItems?: number;
   confirmation?: string;
+  deleteKeys?: string[];
   recursive?: boolean;
+  cleanupOnly?: boolean;
   preserveRoot?: boolean;
   replaceMetadata?: boolean;
   metadata?: UploadMetadata;
@@ -79,6 +81,7 @@ export interface TransferJob {
   startedAt?: string;
   finishedAt?: string;
   error?: PublicError;
+  mappingManifestPath?: string;
 }
 
 export interface TransferSummary {
@@ -454,5 +457,23 @@ export interface UpdateCheckResult {
   schemaVersion: number;
   channel: "stable" | "beta";
   available: boolean;
+  message: string;
+  version?: string;
+  notes?: string;
+  publishedAt?: string;
+  installRequiresConfirmation: boolean;
+  canInstall: boolean;
+}
+
+export interface InstallUpdateRequest {
+  schemaVersion: number;
+  expectedVersion: string;
+  confirmation: string;
+}
+
+export interface InstallUpdateResult {
+  schemaVersion: number;
+  installed: boolean;
+  version: string;
   message: string;
 }

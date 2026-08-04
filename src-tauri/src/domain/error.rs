@@ -79,6 +79,8 @@ pub enum AppError {
     LocalDiskFull,
     #[error("local file changed during transfer")]
     LocalFileChanged,
+    #[error("signed update verification failed: {0}")]
+    UpdateVerificationFailed(String),
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration failed: {0}")]
@@ -254,6 +256,11 @@ impl From<AppError> for PublicError {
                 AppErrorCode::LocalFileChanged,
                 false,
                 "The local file changed during upload; the object was not trusted as a stable snapshot.".to_string(),
+            ),
+            AppError::UpdateVerificationFailed(_) => (
+                AppErrorCode::UpdateVerificationFailed,
+                false,
+                "The signed update could not be verified and was not installed.".to_string(),
             ),
             AppError::Unknown(_) => (
                 AppErrorCode::Unknown,

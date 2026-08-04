@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type DragEvent,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
@@ -33,6 +34,7 @@ import type {
   TransferHistoryPage,
   TransferJob,
   TransferOperation,
+  UpdateCheckResult,
 } from "./lib/types";
 
 const providerLabels: Record<ProviderType, string> = {
@@ -196,6 +198,8 @@ function App() {
     saving,
     testing,
     error,
+    listingError,
+    bucketError,
     testResult,
     bootstrap,
     selectProfile,
@@ -211,6 +215,8 @@ function App() {
     createShare,
     clearPreview,
     clearShare,
+    clearListingError,
+    clearBucketError,
     clearError,
     refreshTransfers,
     startTransfer,
@@ -476,6 +482,20 @@ function App() {
   const selectedSummary = profiles.find(
     (profile) => profile.id === selectedProfileId,
   );
+  const hasActiveTransfers = Boolean(
+    transfers?.items.some((job) =>
+      [
+        "queued",
+        "planning",
+        "waitingForUser",
+        "running",
+        "pausing",
+        "paused",
+        "retrying",
+        "cancelling",
+      ].includes(job.status),
+    ),
+  );
 
   const navigate = (section: string) => {
     setActiveSection(section);
@@ -666,6 +686,8 @@ function App() {
             listing={listing}
             location={location}
             loading={loading}
+            listingError={listingError}
+            bucketError={bucketError}
             onLoadBuckets={() =>
               selectedSummary && void listBuckets(selectedSummary.id)
             }
@@ -693,6 +715,8 @@ function App() {
             onRefresh={() => {
               if (location) void listEntries(location);
             }}
+            onClearListingError={clearListingError}
+            onClearBucketError={clearBucketError}
             onSelectEntry={(entry) => {
               if (!location) return;
               void loadMetadata({
@@ -717,6 +741,14 @@ function App() {
                       ? await commands.pickDirectory()
                       : window.prompt("Download destination folder");
                 if (!destination?.trim()) return;
+                const destinationPath =
+                  entries.length > 1 ||
+                  entries.some((entry) => entry.kind !== "file")
+                    ? destination.trim().endsWith("/") ||
+                      destination.trim().endsWith("\\")
+                      ? destination.trim()
+                      : `${destination.trim()}\\`
+                    : destination.trim();
                 for (const entry of entries) {
                   void startTransfer({
                     schemaVersion: 1,
@@ -729,7 +761,7 @@ function App() {
                       bucket: location.bucket,
                       key: entry.key,
                     },
-                    destination: { kind: "local", path: destination.trim() },
+                    destination: { kind: "local", path: destinationPath },
                     collisionPolicy: "ask",
                     recursive: entry.kind !== "file",
                   });
@@ -767,13 +799,55 @@ function App() {
             }}
             onDeleteSelection={(entries) => {
               if (!location) return;
+              const allFiles = entries.every((entry) => entry.kind === "file");
+              if (allFiles && entries.length > 1) {
+                const knownBytes = entries.reduce(
+                  (total, entry) => total + (entry.size ?? 0),
+                  0,
+                );
+                const requiresTyped =
+                  entries.length > 100 || knownBytes > 10 * 1024 * 1024 * 1024;
+                const confirmation = requiresTyped
+                  ? window.prompt(
+                      `This will delete ${entries.length} selected objects (${formatBytes(knownBytes)} known). Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE ${entries.length} OBJECTS to continue.`,
+                    )
+                  : window.prompt(
+                      `Delete ${entries.length} selected objects? Bucket versioning, Object Lock, and retention may preserve versions or reject deletion. Type DELETE to continue.`,
+                    );
+                if (
+                  confirmation !==
+                  (requiresTyped
+                    ? `DELETE ${entries.length} OBJECTS`
+                    : "DELETE")
+                )
+                  return;
+                void startTransfer({
+                  schemaVersion: 1,
+                  operation: "deleteObjects",
+                  profileId: location.profileId,
+                  source: {
+                    kind: "remote",
+                    profileId: location.profileId,
+                    bucket: location.bucket,
+                    key: entries[0].key,
+                  },
+                  deleteKeys: entries.map((entry) => entry.key),
+                  confirmation,
+                  totalBytes: knownBytes || undefined,
+                  totalItems: entries.length,
+                  recursive: false,
+                });
+                return;
+              }
               for (const entry of entries) {
                 const confirmation =
                   entry.kind !== "file"
                     ? window.prompt(
-                        `Type DELETE ${entry.key.replace(/\/+$/, "")} to delete this prefix.`,
+                        `Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE ${entry.key.replace(/\/+$/, "")} to delete this prefix.`,
                       )
-                    : "DELETE";
+                    : window.prompt(
+                        "Deletion may be preserved by bucket versioning, Object Lock, or retention. Type DELETE to continue.",
+                      );
                 if (!confirmation) continue;
                 void startTransfer({
                   schemaVersion: 1,
@@ -790,7 +864,12 @@ function App() {
                 });
               }
             }}
-            onPasteSelection={(entries, mode, sourceLocation) => {
+            onPasteSelection={(
+              entries,
+              mode,
+              sourceLocation,
+              destinationPrefix,
+            ) => {
               if (!location || entries.length === 0) return;
               if (sourceLocation.profileId !== location.profileId) {
                 window.alert(
@@ -798,6 +877,12 @@ function App() {
                 );
                 return;
               }
+              const targetPrefixRaw = destinationPrefix ?? location.prefix;
+              const targetPrefix = targetPrefixRaw
+                ? targetPrefixRaw.endsWith("/")
+                  ? targetPrefixRaw
+                  : `${targetPrefixRaw}/`
+                : "";
               for (const entry of entries) {
                 const sourceName = entry.key
                   .replace(/\/+$/, "")
@@ -826,7 +911,7 @@ function App() {
                     kind: "remote",
                     profileId: location.profileId,
                     bucket: location.bucket,
-                    key: `${location.prefix}${sourceName}${isFolder ? "/" : ""}`,
+                    key: `${targetPrefix}${sourceName}${isFolder ? "/" : ""}`,
                   },
                   collisionPolicy: "ask",
                   recursive: isFolder,
@@ -939,7 +1024,11 @@ function App() {
             settings={settings}
             onSaved={bootstrap}
           />
-          <DiagnosticsPanel id="diagnostics" />
+          <DiagnosticsPanel
+            id="diagnostics"
+            automaticUpdateCheck={settings?.automaticUpdateCheck ?? true}
+            hasActiveTransfers={hasActiveTransfers}
+          />
 
           <footer className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-muted">
             <span>
@@ -1134,11 +1223,15 @@ function ExplorerPanel({
   listing,
   location,
   loading,
+  listingError,
+  bucketError,
   onLoadBuckets,
   onOpenBucket,
   onOpenPrefix,
   onOpenLocation,
   onRefresh,
+  onClearListingError,
+  onClearBucketError,
   onSelectEntry,
   onDownloadSelection,
   onShareEntry,
@@ -1159,11 +1252,15 @@ function ExplorerPanel({
   } | null;
   location: ExplorerLocation | null;
   loading: boolean;
+  listingError: string | null;
+  bucketError: string | null;
   onLoadBuckets: () => void;
   onOpenBucket: (bucket: string) => void;
   onOpenPrefix: (prefix: string) => void;
   onOpenLocation: (location: ExplorerLocation) => void;
   onRefresh: () => void;
+  onClearListingError: () => void;
+  onClearBucketError: () => void;
   onSelectEntry: (entry: EntrySummary) => void;
   onDownloadSelection: (entries: EntrySummary[]) => void;
   onShareEntry: (entry: EntrySummary) => void;
@@ -1173,6 +1270,7 @@ function ExplorerPanel({
     entries: EntrySummary[],
     mode: "copy" | "move",
     sourceLocation: ExplorerLocation,
+    destinationPrefix?: string,
   ) => void;
   onCreateFolder: (name: string) => void;
   onRenameEntry: (entry: EntrySummary, nextName: string) => void;
@@ -1211,6 +1309,11 @@ function ExplorerPanel({
     entries: EntrySummary[];
     sourceLocation: ExplorerLocation;
   } | null>(null);
+  const [dragPayload, setDragPayload] = useState<{
+    entries: EntrySummary[];
+    sourceLocation: ExplorerLocation;
+  } | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
   const rootPrefix = activeProfile?.rootPrefix ?? "";
   const scope = location
@@ -1221,6 +1324,8 @@ function ExplorerPanel({
     setSelectedIds(new Set());
     setFocusedId(null);
     setContextMenu(null);
+    setDragPayload(null);
+    setDropTargetId(null);
     const nextScope = location
       ? `${location.profileId}:${location.bucket}`
       : "";
@@ -1530,6 +1635,67 @@ function ExplorerPanel({
     if (entry.kind === "file") onSelectEntry(entry);
   };
 
+  const beginRemoteDrag = (
+    event: DragEvent<HTMLButtonElement>,
+    entry: EntrySummary,
+  ) => {
+    if (!location) return;
+    const entries = selectedIds.has(entry.id) ? selectedEntries : [entry];
+    if (!selectedIds.has(entry.id)) {
+      setSelectedIds(new Set([entry.id]));
+      focusEntry(entry.id);
+    }
+    setDragPayload({ entries: [...entries], sourceLocation: location });
+    event.dataTransfer.effectAllowed = "copyMove";
+    // Keep the payload opaque to browser integrations; the in-app state is
+    // authoritative and avoids putting credentials or URLs on the clipboard.
+    event.dataTransfer.setData("application/x-s3fm-remote-selection", "1");
+  };
+
+  const finishRemoteDrag = () => {
+    setDragPayload(null);
+    setDropTargetId(null);
+  };
+
+  const dropRemoteEntries = (
+    event: DragEvent<HTMLElement>,
+    destinationPrefix: string,
+    targetId: string,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const payload = dragPayload;
+    setDropTargetId(null);
+    if (!payload || !location || payload.entries.length === 0) return;
+    const mode = event.shiftKey ? "move" : "copy";
+    event.dataTransfer.dropEffect = mode;
+    if (
+      mode === "move" &&
+      !window.confirm(
+        `Move ${payload.entries.length} selected item${payload.entries.length === 1 ? "" : "s"} to ${destinationPrefix || "the current prefix"}?`,
+      )
+    ) {
+      return;
+    }
+    onPasteSelection(
+      payload.entries,
+      mode,
+      payload.sourceLocation,
+      destinationPrefix,
+    );
+    setDragPayload(null);
+    setDropTargetId(targetId);
+    window.setTimeout(() => setDropTargetId(null), 400);
+  };
+
+  const allowRemoteDrop = (event: DragEvent<HTMLElement>, targetId: string) => {
+    if (!dragPayload || dragPayload.entries.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = event.shiftKey ? "move" : "copy";
+    setDropTargetId(targetId);
+  };
+
   const deleteSelection = () => {
     const selected = loadedEntries.filter((entry) => selectedIds.has(entry.id));
     if (selected.length === 0) return;
@@ -1821,6 +1987,12 @@ function ExplorerPanel({
     </button>
   );
 
+  const explorerError = location ? listingError : bucketError;
+  const clearExplorerError = location
+    ? onClearListingError
+    : onClearBucketError;
+  const retryExplorer = location ? onRefresh : onLoadBuckets;
+
   return (
     <section
       id="explorer"
@@ -1846,6 +2018,43 @@ function ExplorerPanel({
           </button>
         )}
       </div>
+      {profile && explorerError && (
+        <div
+          className="mb-4 flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+          role="alert"
+        >
+          <div className="min-w-0">
+            <p className="font-semibold">
+              {location
+                ? "Unable to load this prefix"
+                : "Unable to load buckets"}
+            </p>
+            <p className="mt-1 break-words text-xs">{explorerError}</p>
+            <p className="mt-1 text-xs text-amber-900/80">
+              {location && listing
+                ? "Previously loaded entries remain visible; this page may be incomplete."
+                : "Retry the request or dismiss this message to continue."}
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <button
+              className="rounded-lg border border-amber-300 bg-white/70 px-2.5 py-1.5 text-xs font-semibold hover:bg-white disabled:opacity-50"
+              type="button"
+              onClick={retryExplorer}
+              disabled={loading}
+            >
+              Retry
+            </button>
+            <button
+              className="rounded-lg px-2.5 py-1.5 text-xs font-semibold hover:bg-amber-100"
+              type="button"
+              onClick={clearExplorerError}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
       {!profile ? (
         <div className="rounded-2xl border border-dashed border-border p-8 text-center text-sm text-muted">
           Choose a saved profile above.
@@ -1873,8 +2082,18 @@ function ExplorerPanel({
         </div>
       ) : (
         <div
+          className={
+            dropTargetId === "__current__"
+              ? "rounded-2xl outline outline-2 outline-accent/60 outline-offset-2"
+              : undefined
+          }
           onKeyDown={handleKeyDown}
           onContextMenu={(event) => openContextMenu(event)}
+          onDragOver={(event) => allowRemoteDrop(event, "__current__")}
+          onDragLeave={() => setDropTargetId(null)}
+          onDrop={(event) =>
+            dropRemoteEntries(event, location.prefix, "__current__")
+          }
           tabIndex={0}
         >
           <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -2115,8 +2334,9 @@ function ExplorerPanel({
                 </div>
                 {visibleEntries.map((entry) => (
                   <button
-                    className={`grid w-full min-w-[640px] grid-cols-[minmax(220px,1fr)_120px_110px_180px_140px] items-center gap-3 border-b border-border px-4 py-3 text-left text-sm last:border-b-0 ${selectedIds.has(entry.id) ? "bg-accent/10" : "hover:bg-canvas"}`}
+                    className={`grid w-full min-w-[640px] grid-cols-[minmax(220px,1fr)_120px_110px_180px_140px] items-center gap-3 border-b border-border px-4 py-3 text-left text-sm last:border-b-0 ${selectedIds.has(entry.id) ? "bg-accent/10" : "hover:bg-canvas"} ${dropTargetId === entry.id ? "outline outline-2 outline-accent outline-offset-[-2px]" : ""}`}
                     key={entry.id}
+                    draggable
                     type="button"
                     ref={(element) => {
                       entryRefs.current[entry.id] = element;
@@ -2124,6 +2344,30 @@ function ExplorerPanel({
                     aria-selected={selectedIds.has(entry.id)}
                     onClick={(event) => updateSelection(entry, event)}
                     onContextMenu={(event) => openContextMenu(event, entry)}
+                    onDragStart={(event) => beginRemoteDrag(event, entry)}
+                    onDragEnd={finishRemoteDrag}
+                    onDragOver={
+                      entry.kind === "file"
+                        ? undefined
+                        : (event) => allowRemoteDrop(event, entry.id)
+                    }
+                    onDragLeave={
+                      entry.kind === "file"
+                        ? undefined
+                        : () => setDropTargetId(null)
+                    }
+                    onDrop={
+                      entry.kind === "file"
+                        ? undefined
+                        : (event) =>
+                            dropRemoteEntries(
+                              event,
+                              entry.key.endsWith("/")
+                                ? entry.key
+                                : `${entry.key}/`,
+                              entry.id,
+                            )
+                    }
                     onDoubleClick={() => activateEntry(entry)}
                   >
                     <span className="flex min-w-0 items-center gap-3">
@@ -2161,8 +2405,9 @@ function ExplorerPanel({
               >
                 {visibleEntries.map((entry) => (
                   <button
-                    className={`rounded-2xl border p-4 text-left transition ${selectedIds.has(entry.id) ? "border-accent bg-accent/10" : "border-border hover:border-accent hover:bg-canvas"}`}
+                    className={`rounded-2xl border p-4 text-left transition ${selectedIds.has(entry.id) ? "border-accent bg-accent/10" : "border-border hover:border-accent hover:bg-canvas"} ${dropTargetId === entry.id ? "outline outline-2 outline-accent outline-offset-2" : ""}`}
                     key={entry.id}
+                    draggable
                     type="button"
                     ref={(element) => {
                       entryRefs.current[entry.id] = element;
@@ -2170,6 +2415,30 @@ function ExplorerPanel({
                     aria-selected={selectedIds.has(entry.id)}
                     onClick={(event) => updateSelection(entry, event)}
                     onContextMenu={(event) => openContextMenu(event, entry)}
+                    onDragStart={(event) => beginRemoteDrag(event, entry)}
+                    onDragEnd={finishRemoteDrag}
+                    onDragOver={
+                      entry.kind === "file"
+                        ? undefined
+                        : (event) => allowRemoteDrop(event, entry.id)
+                    }
+                    onDragLeave={
+                      entry.kind === "file"
+                        ? undefined
+                        : () => setDropTargetId(null)
+                    }
+                    onDrop={
+                      entry.kind === "file"
+                        ? undefined
+                        : (event) =>
+                            dropRemoteEntries(
+                              event,
+                              entry.key.endsWith("/")
+                                ? entry.key
+                                : `${entry.key}/`,
+                              entry.id,
+                            )
+                    }
                     onDoubleClick={() => activateEntry(entry)}
                   >
                     <span
@@ -2197,9 +2466,11 @@ function ExplorerPanel({
             <div className="rounded-2xl border border-dashed border-border p-8 text-center text-sm text-muted">
               {loading
                 ? "Loading objects…"
-                : filter.trim()
-                  ? "No loaded items match. Clear the filter to see all loaded items."
-                  : "This prefix is empty."}
+                : listingError
+                  ? "No page loaded. Retry the request above."
+                  : filter.trim()
+                    ? "No loaded items match. Clear the filter to see all loaded items."
+                    : "This prefix is empty."}
             </div>
           )}
           {listing?.nextToken && (
@@ -3251,9 +3522,11 @@ function SettingsPanel({
 }) {
   const [concurrentJobs, setConcurrentJobs] = useState("4");
   const [partConcurrency, setPartConcurrency] = useState("4");
-  const [multipartThreshold, setMultipartThreshold] = useState("8388608");
-  const [partSize, setPartSize] = useState("8388608");
-  const [retryLimit, setRetryLimit] = useState("3");
+  const [multipartThreshold, setMultipartThreshold] = useState(
+    String(64 * 1024 * 1024),
+  );
+  const [partSize, setPartSize] = useState(String(16 * 1024 * 1024));
+  const [retryLimit, setRetryLimit] = useState("5");
   const [perProfileLimit, setPerProfileLimit] = useState("8");
   const [retryBaseDelay, setRetryBaseDelay] = useState("500");
   const [retryMaxDelay, setRetryMaxDelay] = useState("30000");
@@ -3288,10 +3561,10 @@ function SettingsPanel({
       String(settings.perJobPartConcurrency ?? settings.partConcurrency ?? 4),
     );
     setMultipartThreshold(
-      String(settings.multipartThresholdBytes ?? 8 * 1024 * 1024),
+      String(settings.multipartThresholdBytes ?? 64 * 1024 * 1024),
     );
-    setPartSize(String(settings.initialPartSizeBytes ?? 8 * 1024 * 1024));
-    setRetryLimit(String(settings.retryLimit ?? 3));
+    setPartSize(String(settings.initialPartSizeBytes ?? 16 * 1024 * 1024));
+    setRetryLimit(String(settings.retryLimit ?? 5));
     setPerProfileLimit(String(settings.perProfileRequestLimit ?? 8));
     setRetryBaseDelay(String(settings.retryBaseDelayMs ?? 500));
     setRetryMaxDelay(String(settings.retryMaxDelayMs ?? 30000));
@@ -3418,7 +3691,7 @@ function SettingsPanel({
           <input
             className="input mt-1"
             type="number"
-            min={5 * 1024 * 1024}
+            min={16 * 1024 * 1024}
             max={5 * 1024 * 1024 * 1024}
             value={multipartThreshold}
             onChange={(event) => setMultipartThreshold(event.target.value)}
@@ -3462,164 +3735,176 @@ function SettingsPanel({
             <option value="rename">Rename automatically</option>
           </select>
         </label>
-        <label className="text-sm">
-          History retention (days)
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            max={365}
-            value={historyDays}
-            onChange={(event) => setHistoryDays(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Maximum history jobs
-          <input
-            className="input mt-1"
-            type="number"
-            min={100}
-            max={100000}
-            value={historyMaxJobs}
-            onChange={(event) => setHistoryMaxJobs(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Requests per profile
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            max={32}
-            value={perProfileLimit}
-            onChange={(event) => setPerProfileLimit(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Retry base delay (ms)
-          <input
-            className="input mt-1"
-            type="number"
-            min={100}
-            max={5000}
-            value={retryBaseDelay}
-            onChange={(event) => setRetryBaseDelay(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Retry max delay (ms)
-          <input
-            className="input mt-1"
-            type="number"
-            min={1000}
-            max={120000}
-            value={retryMaxDelay}
-            onChange={(event) => setRetryMaxDelay(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Progress updates (Hz)
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            max={10}
-            value={progressHz}
-            onChange={(event) => setProgressHz(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Preview cache (bytes)
-          <input
-            className="input mt-1"
-            type="number"
-            min={64 * 1024 * 1024}
-            value={previewCacheBytes}
-            onChange={(event) => setPreviewCacheBytes(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Preview cache age (hours)
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            max={168}
-            value={previewCacheAgeHours}
-            onChange={(event) => setPreviewCacheAgeHours(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Log retention (days)
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            max={90}
-            value={logRetentionDays}
-            onChange={(event) => setLogRetentionDays(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Log maximum (bytes)
-          <input
-            className="input mt-1"
-            type="number"
-            min={10 * 1024 * 1024}
-            value={logMaxBytes}
-            onChange={(event) => setLogMaxBytes(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Typed delete object threshold
-          <input
-            className="input mt-1"
-            type="number"
-            min={1}
-            value={typedObjectThreshold}
-            onChange={(event) => setTypedObjectThreshold(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Typed delete bytes threshold
-          <input
-            className="input mt-1"
-            type="number"
-            min={1024 * 1024}
-            value={typedBytesThreshold}
-            onChange={(event) => setTypedBytesThreshold(event.target.value)}
-          />
-        </label>
-        <label className="text-sm">
-          Update channel
-          <select
-            className="input mt-1"
-            value={updateChannel}
-            onChange={(event) =>
-              setUpdateChannel(event.target.value as "stable" | "beta")
-            }
-          >
-            <option value="stable">Stable</option>
-            <option value="beta">Beta</option>
-          </select>
-        </label>
-        <label className="flex items-center gap-2 self-end text-sm">
-          <input
-            type="checkbox"
-            checked={keepPartial}
-            onChange={(event) => setKeepPartial(event.target.checked)}
-          />{" "}
-          Keep partial downloads
-        </label>
-        <label className="flex items-center gap-2 self-end text-sm">
-          <input
-            type="checkbox"
-            checked={automaticUpdateCheck}
-            onChange={(event) => setAutomaticUpdateCheck(event.target.checked)}
-          />
-          Automatic update checks
-        </label>
       </div>
+      <details className="mt-4 rounded-2xl border border-border/70 bg-canvas/30 px-4 py-3">
+        <summary className="cursor-pointer text-sm font-semibold">
+          Advanced settings
+          <span className="ml-2 text-xs font-normal text-muted">
+            Retry, retention, cache, and safety thresholds
+          </span>
+        </summary>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <label className="text-sm">
+            History retention (days)
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              max={365}
+              value={historyDays}
+              onChange={(event) => setHistoryDays(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Maximum history jobs
+            <input
+              className="input mt-1"
+              type="number"
+              min={100}
+              max={100000}
+              value={historyMaxJobs}
+              onChange={(event) => setHistoryMaxJobs(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Requests per profile
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              max={32}
+              value={perProfileLimit}
+              onChange={(event) => setPerProfileLimit(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Retry base delay (ms)
+            <input
+              className="input mt-1"
+              type="number"
+              min={100}
+              max={5000}
+              value={retryBaseDelay}
+              onChange={(event) => setRetryBaseDelay(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Retry max delay (ms)
+            <input
+              className="input mt-1"
+              type="number"
+              min={1000}
+              max={120000}
+              value={retryMaxDelay}
+              onChange={(event) => setRetryMaxDelay(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Progress updates (Hz)
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              max={10}
+              value={progressHz}
+              onChange={(event) => setProgressHz(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Preview cache (bytes)
+            <input
+              className="input mt-1"
+              type="number"
+              min={64 * 1024 * 1024}
+              value={previewCacheBytes}
+              onChange={(event) => setPreviewCacheBytes(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Preview cache age (hours)
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              max={168}
+              value={previewCacheAgeHours}
+              onChange={(event) => setPreviewCacheAgeHours(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Log retention (days)
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              max={90}
+              value={logRetentionDays}
+              onChange={(event) => setLogRetentionDays(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Log maximum (bytes)
+            <input
+              className="input mt-1"
+              type="number"
+              min={10 * 1024 * 1024}
+              value={logMaxBytes}
+              onChange={(event) => setLogMaxBytes(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Typed delete object threshold
+            <input
+              className="input mt-1"
+              type="number"
+              min={1}
+              value={typedObjectThreshold}
+              onChange={(event) => setTypedObjectThreshold(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Typed delete bytes threshold
+            <input
+              className="input mt-1"
+              type="number"
+              min={1024 * 1024}
+              value={typedBytesThreshold}
+              onChange={(event) => setTypedBytesThreshold(event.target.value)}
+            />
+          </label>
+          <label className="text-sm">
+            Update channel
+            <select
+              className="input mt-1"
+              value={updateChannel}
+              onChange={(event) =>
+                setUpdateChannel(event.target.value as "stable" | "beta")
+              }
+            >
+              <option value="stable">Stable</option>
+              <option value="beta">Beta</option>
+            </select>
+          </label>
+          <label className="flex items-center gap-2 self-end text-sm">
+            <input
+              type="checkbox"
+              checked={keepPartial}
+              onChange={(event) => setKeepPartial(event.target.checked)}
+            />{" "}
+            Keep partial downloads
+          </label>
+          <label className="flex items-center gap-2 self-end text-sm">
+            <input
+              type="checkbox"
+              checked={automaticUpdateCheck}
+              onChange={(event) =>
+                setAutomaticUpdateCheck(event.target.checked)
+              }
+            />
+            Automatic update checks
+          </label>
+        </div>
+      </details>
       {message && (
         <p className="mt-3 text-xs text-muted" role="status">
           {message}
@@ -3629,9 +3914,108 @@ function SettingsPanel({
   );
 }
 
-function DiagnosticsPanel({ id }: { id: string }) {
+function DiagnosticsPanel({
+  id,
+  automaticUpdateCheck,
+  hasActiveTransfers,
+}: {
+  id: string;
+  automaticUpdateCheck: boolean;
+  hasActiveTransfers: boolean;
+}) {
   const [destination, setDestination] = useState("");
   const [message, setMessage] = useState("");
+  const [update, setUpdate] = useState<UpdateCheckResult | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [retryAfterTransfers, setRetryAfterTransfers] = useState(false);
+
+  const checkForUpdates = useCallback(async () => {
+    if (!hasNativeTauriRuntime()) {
+      setMessage("Update checks are available in the Windows desktop build.");
+      return null;
+    }
+    setCheckingUpdates(true);
+    try {
+      const result = await commands.checkForUpdates();
+      setUpdate(result);
+      const deferred =
+        /active|deferred|transfer/i.test(result.message) && !result.available;
+      setRetryAfterTransfers(deferred);
+      setMessage(result.message);
+      return result;
+    } catch (error) {
+      setMessage(formatCommandError(error));
+      return null;
+    } finally {
+      setCheckingUpdates(false);
+    }
+  }, []);
+
+  const installUpdate = async () => {
+    const version = update?.version?.trim();
+    if (!version || !update?.canInstall) return;
+    const confirmation = window.prompt(
+      `Type INSTALL UPDATE ${version} to download and install this signed update.`,
+    );
+    if (confirmation !== `INSTALL UPDATE ${version}`) {
+      if (confirmation !== null)
+        setMessage(
+          "Update installation cancelled: confirmation did not match.",
+        );
+      return;
+    }
+    setInstallingUpdate(true);
+    try {
+      const result = await commands.installUpdate({
+        schemaVersion: 1,
+        expectedVersion: version,
+        confirmation,
+      });
+      setMessage(result.message);
+      setRetryAfterTransfers(!result.installed);
+      if (result.installed) setUpdate(null);
+    } catch (error) {
+      setMessage(formatCommandError(error));
+    } finally {
+      setInstallingUpdate(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!automaticUpdateCheck || !hasNativeTauriRuntime()) return;
+    let disposed = false;
+    const key = "s3-file-manager-last-update-check-v1";
+    const intervalMs = 24 * 60 * 60 * 1_000;
+    const runIfDue = () => {
+      if (disposed) return;
+      let last = 0;
+      try {
+        last = Number(localStorage.getItem(key) ?? "0");
+      } catch {
+        last = 0;
+      }
+      if (Number.isFinite(last) && Date.now() - last < intervalMs) return;
+      try {
+        localStorage.setItem(key, String(Date.now()));
+      } catch {
+        // The check still runs when local persistence is unavailable.
+      }
+      void checkForUpdates();
+    };
+    runIfDue();
+    const timer = window.setInterval(runIfDue, intervalMs);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [automaticUpdateCheck, checkForUpdates]);
+
+  useEffect(() => {
+    if (!retryAfterTransfers || hasActiveTransfers) return;
+    void checkForUpdates();
+  }, [checkForUpdates, hasActiveTransfers, retryAfterTransfers]);
+
   const exportDiagnostics = async () => {
     try {
       const result = await commands.exportDiagnostics({
@@ -3695,17 +4079,63 @@ function DiagnosticsPanel({ id }: { id: string }) {
           <button
             className="rounded-xl border border-border px-3 py-2 text-xs font-semibold"
             type="button"
-            onClick={() =>
-              void commands
-                .checkForUpdates()
-                .then((result) => setMessage(result.message))
-                .catch((error) => setMessage(formatCommandError(error)))
-            }
+            onClick={() => void checkForUpdates()}
+            disabled={checkingUpdates}
           >
-            Check updates
+            {checkingUpdates ? "Checking…" : "Check updates"}
           </button>
+          {update?.available && update.version && (
+            <button
+              className="rounded-xl bg-accent px-3 py-2 text-xs font-semibold text-accent-foreground disabled:opacity-50"
+              type="button"
+              onClick={() => void installUpdate()}
+              disabled={installingUpdate || hasActiveTransfers}
+              title={
+                hasActiveTransfers
+                  ? "Finish active transfers before installing an update"
+                  : undefined
+              }
+            >
+              {installingUpdate ? "Installing…" : `Install ${update.version}`}
+            </button>
+          )}
+          {retryAfterTransfers && (
+            <button
+              className="rounded-xl border border-amber-300 px-3 py-2 text-xs font-semibold text-amber-900 disabled:opacity-50"
+              type="button"
+              onClick={() => void checkForUpdates()}
+              disabled={checkingUpdates || hasActiveTransfers}
+            >
+              {hasActiveTransfers
+                ? "Retry after transfers finish"
+                : "Retry update check"}
+            </button>
+          )}
         </div>
       </div>
+      {update?.available && (
+        <div
+          className="mb-3 rounded-2xl border border-accent/30 bg-accent/5 px-4 py-3 text-xs"
+          role="status"
+        >
+          <p className="font-semibold">
+            Signed update {update.version} is available.
+          </p>
+          {update.publishedAt && (
+            <p className="mt-1 text-muted">
+              Published {new Date(update.publishedAt).toLocaleString()}.
+            </p>
+          )}
+          {update.notes && (
+            <p className="mt-1 whitespace-pre-wrap text-muted">
+              {update.notes}
+            </p>
+          )}
+          <p className="mt-2 text-muted">
+            Installation always requires explicit confirmation and a restart.
+          </p>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         <input
           className="input min-w-[18rem] flex-1"
@@ -3772,11 +4202,14 @@ function ProfileEditor({
     value: ProfileDraft[K],
   ) => setDraft((current) => ({ ...current, [key]: value }));
   const isCustomEndpoint =
-    draft.provider === "customS3" || draft.provider === "minio";
+    draft.provider === "customS3" ||
+    draft.provider === "minio" ||
+    draft.provider === "cloudflareR2";
   const clearSecretFields = () => {
     secretFields.current = { secretAccessKey: "", sessionToken: "" };
   };
   const setProvider = (provider: ProviderType) => {
+    if (provider === "cloudflareR2") secretFields.current.sessionToken = "";
     const defaults: Record<ProviderType, Partial<ProfileDraft>> = {
       awsS3: {
         region: "",
@@ -3788,6 +4221,7 @@ function ProfileEditor({
         region: "auto",
         endpoint: "",
         addressingStyle: "virtualHosted",
+        credentialMode: "static",
         allowInsecureHttp: false,
       },
       minio: {
@@ -3942,7 +4376,9 @@ function ProfileEditor({
               }
             >
               <option value="static">Static access key</option>
-              <option value="temporarySession">Temporary session</option>
+              {draft.provider !== "cloudflareR2" && (
+                <option value="temporarySession">Temporary session</option>
+              )}
             </select>
           </Field>
           <Field label="Access key ID" required={!profile}>
@@ -3981,6 +4417,7 @@ function ProfileEditor({
               className="input"
               type="password"
               defaultValue={initial.sessionToken}
+              disabled={draft.provider === "cloudflareR2"}
               onChange={(event) => {
                 secretFields.current.sessionToken = event.target.value;
               }}

@@ -30,6 +30,8 @@ import type {
   TransferDetails,
   TransferJob,
   UpdateCheckResult,
+  InstallUpdateRequest,
+  InstallUpdateResult,
 } from "./types";
 
 export function isPublicError(value: unknown): value is PublicError {
@@ -147,6 +149,8 @@ export const commands = {
     invoke<DiagnosticsExportResult>("export_diagnostics", { request }),
   clearLogs: () => invoke<number>("clear_logs"),
   checkForUpdates: () => invoke<UpdateCheckResult>("check_for_updates"),
+  installUpdate: (request: InstallUpdateRequest) =>
+    invoke<InstallUpdateResult>("install_update", { request }),
   pickFile: () => invoke<string | null>("pick_file"),
   pickDirectory: () => invoke<string | null>("pick_directory"),
   pickSaveFile: (defaultName?: string) =>

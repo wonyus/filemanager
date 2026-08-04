@@ -174,6 +174,8 @@ pub struct TransferJob {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub error: Option<PublicError>,
+    #[serde(default)]
+    pub mapping_manifest_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -279,6 +281,8 @@ pub struct TransferResult {
     pub failed_items: u64,
     pub cleanup_required_items: u64,
     pub error: Option<PublicError>,
+    #[serde(default)]
+    pub mapping_manifest_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -320,11 +324,18 @@ pub struct StartTransferRequest {
     /// Destructive operations require an explicit confirmation token.  The
     /// token is never persisted in transfer history.
     pub confirmation: Option<String>,
+    /// Optional explicit object selection for one batched delete job. The
+    /// source endpoint supplies the profile and bucket for every key.
+    #[serde(default)]
+    pub delete_keys: Option<Vec<String>>,
     /// Delete operations remove the object identified by `source` by default.
     /// When set, or when the key ends in `/`, the object is treated as a
     /// prefix and all matching objects are deleted in bounded batches.
     #[serde(default)]
     pub recursive: bool,
+    /// Internal retry marker used for Copy → Verify → Delete cleanup jobs.
+    #[serde(skip)]
+    pub cleanup_only: bool,
     /// Upload-directory policy: include the selected folder name in the
     /// destination prefix when enabled.
     #[serde(default = "default_preserve_root")]

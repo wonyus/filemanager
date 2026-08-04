@@ -42,7 +42,10 @@ function validateHttpsUrl(errors, name, { required = false } = {}) {
   return raw;
 }
 
-export function validateReleaseConfig({ strict = false } = {}) {
+export function validateReleaseConfig({
+  strict = false,
+  requireManifest = true,
+} = {}) {
   const errors = [];
   const warnings = [];
   const version = value("S3FM_RELEASE_VERSION");
@@ -119,10 +122,14 @@ export function validateReleaseConfig({ strict = false } = {}) {
   const artifactUrl = validateHttpsUrl(
     errors,
     "S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64",
-    { required: strict },
+    { required: strict && requireManifest },
+  );
+  const artifactBaseUrl = validateHttpsUrl(
+    errors,
+    "S3FM_UPDATE_ARTIFACT_BASE_URL",
   );
   const signature = value("TAURI_UPDATER_SIGNATURE_WINDOWS_X86_64");
-  if (strict && !signature)
+  if (strict && requireManifest && !signature)
     errors.push(
       "TAURI_UPDATER_SIGNATURE_WINDOWS_X86_64 is required to generate the manifest",
     );
@@ -131,7 +138,8 @@ export function validateReleaseConfig({ strict = false } = {}) {
       "TAURI_UPDATER_SIGNATURE_WINDOWS_X86_64 contains a placeholder",
     );
   const pubDate = value("S3FM_RELEASE_PUB_DATE");
-  if (strict && !pubDate) errors.push("S3FM_RELEASE_PUB_DATE is required");
+  if (strict && requireManifest && !pubDate)
+    errors.push("S3FM_RELEASE_PUB_DATE is required");
   if (pubDate && Number.isNaN(Date.parse(pubDate)))
     errors.push("S3FM_RELEASE_PUB_DATE must be an ISO-8601 timestamp");
 
@@ -143,6 +151,7 @@ export function validateReleaseConfig({ strict = false } = {}) {
     certificateThumbprint,
     certificatePath,
     artifactUrl,
+    artifactBaseUrl,
     signature,
     pubDate,
   ].some(Boolean);
@@ -172,7 +181,10 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   const strict = process.argv.includes("--strict");
-  const result = validateReleaseConfig({ strict });
+  const result = validateReleaseConfig({
+    strict,
+    requireManifest: !process.argv.includes("--config-only"),
+  });
   for (const warning of result.warnings)
     console.warn(`release config warning: ${warning}`);
   if (result.errors.length) {

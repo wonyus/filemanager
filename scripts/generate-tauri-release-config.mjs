@@ -11,7 +11,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { validateReleaseConfig, value } from "./validate-release-config.mjs";
 
-const config = validateReleaseConfig({ strict: true });
+// Build configuration is generated before the updater archive exists.  The
+// archive URL/signature are validated by generate-update-manifest.mjs after
+// the protected build has produced the `.sig` file.
+const config = validateReleaseConfig({ strict: true, requireManifest: false });
 if (config.errors.length) {
   console.error(
     "Cannot generate Tauri release config because release configuration is incomplete:",
@@ -25,6 +28,10 @@ const output =
   path.join("dist", "tauri.release.conf.json");
 const generated = {
   $schema: "https://schema.tauri.app/config/2",
+  // The release input is authoritative for the executable and installer
+  // version as well as for the signed manifest.  Development builds keep the
+  // package version from tauri.conf.json; protected releases override it here.
+  version: config.version,
   bundle: {
     createUpdaterArtifacts: "v1Compatible",
     windows: {

@@ -18,30 +18,64 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const MAX_IN_MEMORY_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
+// A 640 MiB upper bound supports the S3 5 TiB object limit within 10,000
+// parts while keeping each bounded upload buffer far below a whole object.
+const MAX_IN_MEMORY_PART_BYTES: u64 = 640 * 1024 * 1024;
 const SINGLE_COPY_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_COPY_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: u64 = 10_000;
 
-fn multipart_copy_ranges(source_size: u64) -> Result<Vec<(i32, u64, u64)>, AppError> {
-    let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
-    if part_count > 10_000 {
+fn effective_multipart_part_size(configured: u64, object_size: u64) -> Result<u64, AppError> {
+    let configured = configured.clamp(MIN_MULTIPART_PART_BYTES, 5 * 1024 * 1024 * 1024);
+    let required = object_size.div_ceil(MAX_MULTIPART_PARTS);
+    let part_size = configured.max(required).min(MAX_IN_MEMORY_PART_BYTES);
+    if object_size.div_ceil(part_size) > MAX_MULTIPART_PARTS {
         return Err(AppError::Validation(
-            "object requires too many multipart copy parts".to_string(),
+            "object exceeds the S3 multipart object-size limit".to_string(),
         ));
     }
+    Ok(part_size)
+}
+
+fn multipart_copy_ranges(source_size: u64) -> Result<Vec<(i32, u64, u64)>, AppError> {
+    let part_size = effective_multipart_part_size(MULTIPART_COPY_PART_BYTES, source_size)?;
+    let part_count = source_size.div_ceil(part_size);
     Ok((0..part_count)
         .map(|index| {
-            let start = index.saturating_mul(MULTIPART_COPY_PART_BYTES);
-            let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
+            let start = index.saturating_mul(part_size);
+            let end = (start + part_size - 1).min(source_size - 1);
             (i32::try_from(index + 1).unwrap_or(i32::MAX), start, end)
         })
         .collect())
 }
 
+/// Validate a destructive-operation acknowledgement at the Rust boundary.
+/// For ordinary deletes the token is the literal `DELETE`; recursive deletes
+/// additionally pass their exact `DELETE <prefix>` token once the plan has
+/// been enumerated. Keeping this check independent of the UI prevents direct
+/// IPC callers from bypassing the confirmation requirement.
+fn require_delete_confirmation(actual: &str, expected: Option<&str>) -> Result<(), AppError> {
+    if actual.trim().is_empty() {
+        return Err(AppError::Validation(
+            "delete confirmation required; confirm the destructive operation to continue"
+                .to_string(),
+        ));
+    }
+    if let Some(expected) = expected {
+        if actual != expected {
+            return Err(AppError::Validation(format!(
+                "delete confirmation is invalid; enter `{expected}` to continue"
+            )));
+        }
+    }
+    Ok(())
+}
+
 use crate::{
     application::profile_service::ProfileService,
     domain::{
-        error::{is_credential_expired_message, AppError},
+        error::{is_credential_expired_message, AppError, PublicError},
         profile::ConnectionProfile,
     },
     dto::{
@@ -58,7 +92,7 @@ use crate::{
     transfer::{
         path_mapping::{map_key_to_local, validate_local_path_length},
         recursive::{
-            execute_recursive, plan_download_prefix, plan_remote_prefix,
+            execute_recursive, is_reparse_point, plan_download_prefix, plan_remote_prefix,
             plan_upload_directory_with_options, write_mapping_manifest, CancellationFlag,
             RecursiveExecutor, RecursiveItem, RecursivePlan, RemoteObject,
         },
@@ -161,6 +195,19 @@ impl TransferService {
     }
 
     pub async fn retry(&self, id: Uuid) -> Result<TransferJob, AppError> {
+        let previous = self
+            .manager
+            .get(id)
+            .await
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        if previous.status == TransferStatus::CompletedWithWarnings
+            && matches!(
+                previous.operation,
+                TransferOperation::MoveObject | TransferOperation::MovePrefix
+            )
+        {
+            self.manager.mark_cleanup_retry(id).await?;
+        }
         let job = self.manager.retry(id).await?;
         let request = self.manager.request(job.id).await.ok_or_else(|| {
             AppError::Unknown("retried transfer request was not retained".to_string())
@@ -180,7 +227,35 @@ impl TransferService {
                     "transfer cancelled".to_string(),
                 ));
             }
-            let settings = request.settings_snapshot.clone().unwrap_or_default();
+            let mut settings = request.settings_snapshot.clone().unwrap_or_default();
+            let request_profile_id = request
+                .profile_id
+                .clone()
+                .or_else(|| match &request.source {
+                    TransferEndpoint::Remote { profile_id, .. } => Some(profile_id.clone()),
+                    TransferEndpoint::Local { .. } => None,
+                });
+            let _profile_request_permit = if let Some(profile_id) = request_profile_id.as_deref() {
+                // A multipart job can issue one SDK request per part worker.
+                // Reserve that width from the profile budget and clamp the
+                // worker count when the configured profile limit is lower.
+                let part_concurrency = settings
+                    .per_job_part_concurrency
+                    .clamp(1, 16)
+                    .min(settings.per_profile_request_limit.clamp(1, 32));
+                settings.per_job_part_concurrency = part_concurrency;
+                settings.part_concurrency = u32::from(part_concurrency);
+                self.clients
+                    .configure_request_limit(profile_id, settings.per_profile_request_limit)
+                    .await;
+                Some(
+                    self.clients
+                        .acquire_requests(profile_id, usize::from(part_concurrency))
+                        .await?,
+                )
+            } else {
+                None
+            };
             let outcome = self.execute_with_retry(id, &request, &settings).await?;
             if self.manager.is_cancel_requested(id).await {
                 return Err(AppError::TransferStateConflict(
@@ -284,14 +359,26 @@ impl TransferService {
             TransferOperation::UploadFile => self.upload_file(id, request, settings).await,
             TransferOperation::DownloadFile => self.download_file(id, request, settings).await,
             TransferOperation::CopyObject => self.copy_object(id, request).await,
-            TransferOperation::MoveObject => self.move_object(id, request).await,
-            TransferOperation::DeleteObjects => self.delete_object(id, request).await,
+            TransferOperation::MoveObject => {
+                if request.cleanup_only {
+                    self.cleanup_move_object(id, request).await
+                } else {
+                    self.move_object(id, request).await
+                }
+            }
+            TransferOperation::DeleteObjects => self.delete_object(id, request, settings).await,
             TransferOperation::UploadDirectory => {
                 self.upload_directory(id, request, settings).await
             }
             TransferOperation::DownloadPrefix => self.download_prefix(id, request, settings).await,
             TransferOperation::CopyPrefix => self.copy_prefix(id, request, settings).await,
-            TransferOperation::MovePrefix => self.move_prefix(id, request, settings).await,
+            TransferOperation::MovePrefix => {
+                if request.cleanup_only {
+                    self.cleanup_move_prefix(id, request, settings).await
+                } else {
+                    self.move_prefix(id, request, settings).await
+                }
+            }
         }
     }
 
@@ -439,16 +526,7 @@ impl TransferService {
         settings: &SettingsSnapshot,
         metadata: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
-        let part_size = settings
-            .initial_part_size_bytes
-            .clamp(5 * 1024 * 1024, 5 * 1024 * 1024 * 1024)
-            .min(MAX_IN_MEMORY_PART_BYTES);
-        let part_count = size.div_ceil(part_size);
-        if part_count > 10_000 {
-            return Err(AppError::Validation(
-                "object requires too many multipart parts".to_string(),
-            ));
-        }
+        let part_size = effective_multipart_part_size(settings.initial_part_size_bytes, size)?;
         let mut upload_builder = client.create_multipart_upload().bucket(bucket).key(key);
         if let Some(value) = upload_content_type(source, metadata) {
             upload_builder = upload_builder.content_type(value);
@@ -643,14 +721,19 @@ impl TransferService {
     ) -> Result<ExecutionOutcome, AppError> {
         self.manager.checkpoint(id).await?;
         let (profile, bucket, key) = self.remote_target(Some(&request.source)).await?;
+        let destination_directory_hint = request
+            .destination
+            .as_ref()
+            .is_some_and(local_endpoint_has_directory_hint);
         let mut destination = local_path(request.destination.as_ref().ok_or_else(|| {
             AppError::Validation("download destination is required".to_string())
         })?)?;
+        ensure_local_path_not_reparse(&destination)?;
         // A directory picked for a multi-selection download is resolved to a
         // deterministic, sanitized leaf before collision handling. A
         // Save-file picker returns a non-directory path and keeps its explicit
         // user-selected filename unchanged.
-        if destination.is_dir() {
+        if destination.is_dir() || destination_directory_hint {
             let leaf = key
                 .trim_end_matches('/')
                 .rsplit('/')
@@ -658,6 +741,7 @@ impl TransferService {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| AppError::Validation("object key has no file name".to_string()))?;
             destination = map_key_to_local(&destination, "", leaf)?;
+            ensure_local_path_not_reparse(&destination)?;
         }
         if destination.exists() && request.collision_policy != CollisionPolicy::Replace {
             if request.collision_policy == CollisionPolicy::Skip {
@@ -673,6 +757,7 @@ impl TransferService {
         }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
+            ensure_local_path_not_reparse(&destination)?;
         }
         let credentials = resolve_profile_credentials(self.credentials.as_ref(), &profile).await?;
         let client = self.clients.get_or_create(&profile, &credentials).await?;
@@ -982,6 +1067,7 @@ impl TransferService {
         replace_metadata: bool,
         replacement: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
+        let part_size = effective_multipart_part_size(MULTIPART_COPY_PART_BYTES, source_size)?;
         let ranges = multipart_copy_ranges(source_size)?;
         let mut create = client
             .create_multipart_upload()
@@ -1045,7 +1131,7 @@ impl TransferService {
                 destination_bucket,
                 destination_key,
                 &upload_id,
-                MULTIPART_COPY_PART_BYTES,
+                part_size,
             )
             .await
         {
@@ -1199,6 +1285,73 @@ impl TransferService {
         result
     }
 
+    async fn cleanup_move_object(
+        &self,
+        id: Uuid,
+        request: &StartTransferRequest,
+    ) -> Result<ExecutionOutcome, AppError> {
+        self.manager.checkpoint(id).await?;
+        let (source_profile, source_bucket, source_key) =
+            self.remote_target(Some(&request.source)).await?;
+        let destination = request.destination.as_ref().ok_or_else(|| {
+            AppError::Validation("move cleanup destination is required".to_string())
+        })?;
+        let (destination_profile, destination_bucket, destination_key) =
+            self.remote_target(Some(destination)).await?;
+        if source_profile.id != destination_profile.id || source_bucket != destination_bucket {
+            return Err(AppError::UnsupportedProviderFeature(
+                "move cleanup requires the original profile and bucket".to_string(),
+            ));
+        }
+        let credentials =
+            resolve_profile_credentials(self.credentials.as_ref(), &source_profile).await?;
+        let client = self
+            .clients
+            .get_or_create(&source_profile, &credentials)
+            .await?;
+        let source_head = match client
+            .head_object()
+            .bucket(&source_bucket)
+            .key(&source_key)
+            .send()
+            .await
+        {
+            Ok(head) => Some(head),
+            Err(error) if is_not_found_provider_error(&error) => None,
+            Err(error) => return Err(AppError::Provider(safe_provider_error(&error))),
+        };
+        let destination_head = client
+            .head_object()
+            .bucket(&destination_bucket)
+            .key(&destination_key)
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        if let Some(source_head) = source_head.as_ref() {
+            let source_size = source_head.content_length().unwrap_or_default().max(0) as u64;
+            let destination_size =
+                destination_head.content_length().unwrap_or_default().max(0) as u64;
+            if source_size != destination_size || !checksums_match(source_head, &destination_head) {
+                return Err(AppError::Provider(
+                    "cleanup verification failed; destination no longer matches source".to_string(),
+                ));
+            }
+        }
+        if source_head.is_some() {
+            client
+                .delete_object()
+                .bucket(&source_bucket)
+                .key(&source_key)
+                .send()
+                .await
+                .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        }
+        Ok(ExecutionOutcome::completed(
+            destination_head.content_length().unwrap_or_default().max(0) as u64,
+            1,
+        ))
+    }
+
     async fn move_object(
         &self,
         id: Uuid,
@@ -1255,10 +1408,179 @@ impl TransferService {
         Ok(result)
     }
 
+    async fn cleanup_move_prefix(
+        &self,
+        id: Uuid,
+        request: &StartTransferRequest,
+        _settings: &SettingsSnapshot,
+    ) -> Result<ExecutionOutcome, AppError> {
+        let (source_profile, bucket, source_prefix) =
+            self.remote_target(Some(&request.source)).await?;
+        let destination = request.destination.as_ref().ok_or_else(|| {
+            AppError::Validation("move cleanup destination is required".to_string())
+        })?;
+        let (destination_profile, destination_bucket, destination_prefix) =
+            self.remote_target(Some(destination)).await?;
+        if source_profile.id != destination_profile.id || bucket != destination_bucket {
+            return Err(AppError::UnsupportedProviderFeature(
+                "move cleanup requires the original profile and bucket".to_string(),
+            ));
+        }
+        let credentials =
+            resolve_profile_credentials(self.credentials.as_ref(), &source_profile).await?;
+        let client = self
+            .clients
+            .get_or_create(&source_profile, &credentials)
+            .await?;
+        let objects = self
+            .list_remote_objects(id, &client, &bucket, &source_prefix)
+            .await?;
+        let existing = self
+            .list_remote_objects(id, &client, &bucket, &destination_prefix)
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect::<HashSet<_>>();
+        let plan = plan_remote_prefix(
+            TransferOperation::MovePrefix,
+            &source_profile.id.to_string(),
+            &bucket,
+            &source_prefix,
+            &destination_prefix,
+            &objects,
+            CollisionPolicy::Replace,
+            &existing,
+        )?;
+        self.manager
+            .set_totals(
+                id,
+                Some(plan.items.len() as u64),
+                Some(plan.items.iter().filter_map(|item| item.size_bytes).sum()),
+            )
+            .await?;
+        let snapshots = plan
+            .items
+            .iter()
+            .map(recursive_item_snapshot)
+            .collect::<Vec<_>>();
+        self.manager.replace_transfer_items(id, &snapshots).await?;
+        let mut completed = 0_u64;
+        let mut failed = 0_u64;
+        let mut transferred = 0_u64;
+        for item in &plan.items {
+            self.manager.checkpoint(id).await?;
+            let (
+                TransferEndpoint::Remote {
+                    key: source_key, ..
+                },
+                TransferEndpoint::Remote {
+                    key: destination_key,
+                    ..
+                },
+            ) = (&item.source, &item.destination)
+            else {
+                continue;
+            };
+            let source_head = match client
+                .head_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .send()
+                .await
+            {
+                Ok(head) => Some(head),
+                Err(error) if is_not_found_provider_error(&error) => None,
+                Err(error) => return Err(AppError::Provider(safe_provider_error(&error))),
+            };
+            let outcome = async {
+                let destination_head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(destination_key)
+                    .send()
+                    .await
+                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                if let Some(source_head) = source_head.as_ref() {
+                    let source_size =
+                        source_head.content_length().unwrap_or_default().max(0) as u64;
+                    let destination_size =
+                        destination_head.content_length().unwrap_or_default().max(0) as u64;
+                    if source_size != destination_size
+                        || !checksums_match(source_head, &destination_head)
+                    {
+                        return Err(AppError::Provider(
+                            "cleanup verification failed; destination no longer matches source"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if source_head.is_some() {
+                    client
+                        .delete_object()
+                        .bucket(&bucket)
+                        .key(source_key)
+                        .send()
+                        .await
+                        .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                }
+                Ok::<u64, AppError>(
+                    destination_head.content_length().unwrap_or_default().max(0) as u64
+                )
+            }
+            .await;
+            match outcome {
+                Ok(bytes) => {
+                    completed += 1;
+                    transferred = transferred.saturating_add(bytes);
+                    self.manager
+                        .update_transfer_item(
+                            id,
+                            &item.id,
+                            TransferStatus::Completed,
+                            bytes,
+                            None,
+                            false,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    failed += 1;
+                    let public = PublicError::from(error);
+                    self.manager
+                        .update_transfer_item(
+                            id,
+                            &item.id,
+                            TransferStatus::Failed,
+                            0,
+                            Some(&public),
+                            true,
+                        )
+                        .await?;
+                }
+            }
+            self.manager
+                .update_progress(id, transferred, completed, None, None)
+                .await?;
+        }
+        Ok(ExecutionOutcome {
+            transferred_bytes: transferred,
+            completed_items: completed,
+            failed_items: failed,
+            cleanup_required_items: failed,
+            status: if failed == 0 {
+                TransferStatus::Completed
+            } else {
+                TransferStatus::CompletedWithWarnings
+            },
+            skipped: false,
+        })
+    }
+
     async fn delete_object(
         &self,
         id: Uuid,
         request: &StartTransferRequest,
+        settings: &SettingsSnapshot,
     ) -> Result<ExecutionOutcome, AppError> {
         let (profile, bucket, key) = self.remote_target(Some(&request.source)).await?;
         self.manager.checkpoint(id).await?;
@@ -1274,8 +1596,74 @@ impl TransferService {
                     .to_string(),
             ));
         }
+        let confirmation = request.confirmation.as_deref().unwrap_or_default();
+        // Confirmation is enforced at the Rust boundary as well as in the
+        // renderer.  A caller that invokes the command directly must not be
+        // able to bypass the destructive-operation prompt. Recursive jobs
+        // use a non-empty acknowledgement here; large jobs are checked
+        // against the exact prefix token after enumeration below.
+        let direct_confirmation = if request.delete_keys.is_some() {
+            None
+        } else {
+            (!recursive).then_some("DELETE")
+        };
+        require_delete_confirmation(confirmation, direct_confirmation)?;
+        if request.delete_keys.is_some() {
+            // Explicit multi-selection uses `DELETE` for ordinary batches and
+            // an exact count token for large batches.  Either way, an empty
+            // acknowledgement must never reach the provider.
+            require_delete_confirmation(confirmation, None)?;
+        }
         let credentials = resolve_profile_credentials(self.credentials.as_ref(), &profile).await?;
         let client = self.clients.get_or_create(&profile, &credentials).await?;
+
+        if let Some(delete_keys) = request.delete_keys.as_ref() {
+            if recursive {
+                return Err(AppError::Validation(
+                    "explicit delete selections cannot be recursive".to_string(),
+                ));
+            }
+            if delete_keys.is_empty() || delete_keys.len() > 10_000 {
+                return Err(AppError::Validation(
+                    "delete selection must contain between 1 and 10000 objects".to_string(),
+                ));
+            }
+            let mut objects = Vec::with_capacity(delete_keys.len());
+            for selected_key in delete_keys {
+                authorize_key(&profile, &bucket, selected_key)?;
+                let size_bytes = match client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(selected_key)
+                    .send()
+                    .await
+                {
+                    Ok(head) => head
+                        .content_length()
+                        .and_then(|value| u64::try_from(value).ok()),
+                    Err(error) if is_not_found_provider_error(&error) => None,
+                    Err(error) => return Err(AppError::Provider(safe_provider_error(&error))),
+                };
+                objects.push(RemoteObject {
+                    key: selected_key.clone(),
+                    size_bytes,
+                    is_folder_marker: selected_key.ends_with('/'),
+                });
+            }
+            let expected = format!("DELETE {} OBJECTS", objects.len());
+            return self
+                .delete_prefix(
+                    id,
+                    &client,
+                    &bucket,
+                    "",
+                    confirmation,
+                    settings,
+                    Some(objects),
+                    Some(expected),
+                )
+                .await;
+        }
 
         if recursive {
             return self
@@ -1284,7 +1672,10 @@ impl TransferService {
                     &client,
                     &bucket,
                     &key,
-                    request.confirmation.as_deref().unwrap_or_default(),
+                    confirmation,
+                    settings,
+                    None,
+                    None,
                 )
                 .await;
         }
@@ -1302,6 +1693,7 @@ impl TransferService {
     /// Delete all objects below a prefix using S3's multi-object delete API.
     /// Listing remains paginated and every page/batch observes the transfer
     /// checkpoint so pause/cancel requests are honored between provider calls.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_prefix(
         &self,
         id: Uuid,
@@ -1309,8 +1701,14 @@ impl TransferService {
         bucket: &str,
         prefix: &str,
         confirmation: &str,
+        settings: &SettingsSnapshot,
+        objects_override: Option<Vec<RemoteObject>>,
+        typed_confirmation_override: Option<String>,
     ) -> Result<ExecutionOutcome, AppError> {
-        let objects = self.list_remote_objects(id, client, bucket, prefix).await?;
+        let objects = match objects_override {
+            Some(objects) => objects,
+            None => self.list_remote_objects(id, client, bucket, prefix).await?,
+        };
         if objects.is_empty() {
             return Ok(ExecutionOutcome::completed(0, 0));
         }
@@ -1318,13 +1716,13 @@ impl TransferService {
             .iter()
             .filter_map(|object| object.size_bytes)
             .sum::<u64>();
-        if objects.len() > 100 || known_bytes > 10 * 1024 * 1024 * 1024 {
-            let expected = format!("DELETE {}", prefix.trim_end_matches('/'));
-            if confirmation != expected {
-                return Err(AppError::Validation(format!(
-                    "typed confirmation required; enter `{expected}` to delete this prefix"
-                )));
-            }
+        if (objects.len() as u64) > settings.typed_confirm_object_threshold
+            || known_bytes > settings.typed_confirm_bytes_threshold
+        {
+            let expected = typed_confirmation_override
+                .clone()
+                .unwrap_or_else(|| format!("DELETE {}", prefix.trim_end_matches('/')));
+            require_delete_confirmation(confirmation, Some(&expected))?;
         }
         let total_bytes = objects
             .iter()
@@ -1334,9 +1732,30 @@ impl TransferService {
         self.manager
             .set_totals(id, Some(objects.len() as u64), total_bytes)
             .await?;
+        // Keep a durable item record for every planned delete. This makes
+        // Object Lock/retention failures actionable per object instead of
+        // reducing a batch response to one aggregate warning.
+        let item_snapshots = objects
+            .iter()
+            .map(|object| TransferItem {
+                schema_version: crate::dto::transfer::DTO_SCHEMA_VERSION,
+                id: object.key.clone(),
+                source_key: Some(object.key.clone()),
+                destination_key: None,
+                local_path: None,
+                size_bytes: object.size_bytes,
+                status: TransferStatus::Queued,
+                retry_count: 0,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        self.manager
+            .replace_transfer_items(id, &item_snapshots)
+            .await?;
 
         let mut completed_items = 0_u64;
         let mut failed_items = 0_u64;
+        let mut completed_bytes = 0_u64;
         let mut failure_codes = Vec::<String>::new();
         let mut first_batch_error = None::<String>;
 
@@ -1380,32 +1799,115 @@ impl TransferService {
                     if first_batch_error.is_none() {
                         first_batch_error = Some(safe_provider_error(&error));
                     }
+                    let public_error =
+                        PublicError::from(AppError::Provider(safe_provider_error(&error)));
+                    for object in chunk {
+                        self.manager
+                            .update_transfer_item(
+                                id,
+                                &object.key,
+                                TransferStatus::Failed,
+                                0,
+                                Some(&public_error),
+                                false,
+                            )
+                            .await?;
+                    }
                     self.manager
-                        .update_progress(id, 0, completed_items, None, None)
+                        .update_progress(id, completed_bytes, completed_items, None, None)
                         .await?;
                     continue;
                 }
             };
 
-            let errors = output.errors();
-            let batch_failed = errors.len().min(chunk.len()) as u64;
-            failed_items = failed_items.saturating_add(batch_failed);
-            completed_items =
-                completed_items.saturating_add((chunk.len() as u64).saturating_sub(batch_failed));
-            for error in errors {
-                if let Some(code) = error.code() {
-                    if failure_codes.len() < 3 && !failure_codes.iter().any(|item| item == code) {
-                        failure_codes.push(code.to_string());
+            // Own the response details before awaiting item persistence. The
+            // SDK output borrows its error slice, while the manager writes may
+            // yield between each item.
+            let errors = output
+                .errors()
+                .iter()
+                .map(|error| {
+                    (
+                        error.key().map(ToString::to_string),
+                        error.code().map(ToString::to_string),
+                        error.message().map(ToString::to_string),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut unmatched_errors = errors
+                .iter()
+                .filter(|(key, _, _)| {
+                    key.as_deref()
+                        .map(|key| !chunk.iter().any(|object| object.key == key))
+                        .unwrap_or(true)
+                })
+                .count();
+            for object in chunk {
+                let matched_error = errors
+                    .iter()
+                    .find(|(error_key, _, _)| error_key.as_deref() == Some(object.key.as_str()))
+                    .map(|(_, code, message)| (code.as_deref(), message.as_deref()));
+                let object_error = match matched_error {
+                    Some(value) => Some(value),
+                    None if unmatched_errors > 0 => {
+                        unmatched_errors -= 1;
+                        Some((None, None))
                     }
+                    None => None,
+                };
+                if let Some((code, message)) = object_error {
+                    failed_items = failed_items.saturating_add(1);
+                    let description = match (code, message) {
+                        (Some(code), Some(message)) => {
+                            format!("{code}: {message}")
+                        }
+                        (Some(code), None) => code.to_string(),
+                        (None, Some(message)) => message.to_string(),
+                        (None, None) => "provider rejected deletion".to_string(),
+                    };
+                    if let Some(code) = code {
+                        if failure_codes.len() < 3 && !failure_codes.iter().any(|item| item == code)
+                        {
+                            failure_codes.push(code.to_string());
+                        }
+                    }
+                    let public_error = PublicError::from(AppError::Provider(description));
+                    self.manager
+                        .update_transfer_item(
+                            id,
+                            &object.key,
+                            TransferStatus::Failed,
+                            0,
+                            Some(&public_error),
+                            false,
+                        )
+                        .await?;
+                } else {
+                    completed_items = completed_items.saturating_add(1);
+                    completed_bytes =
+                        completed_bytes.saturating_add(object.size_bytes.unwrap_or_default());
+                    self.manager
+                        .update_transfer_item(
+                            id,
+                            &object.key,
+                            TransferStatus::Completed,
+                            object.size_bytes.unwrap_or_default(),
+                            None,
+                            false,
+                        )
+                        .await?;
                 }
             }
             self.manager
-                .update_progress(id, 0, completed_items, None, None)
+                .update_progress(id, completed_bytes, completed_items, None, None)
                 .await?;
         }
 
         if failed_items == 0 {
-            return Ok(ExecutionOutcome::completed(0, completed_items));
+            return Ok(ExecutionOutcome::completed(
+                completed_bytes,
+                completed_items,
+            ));
         }
 
         let mut summary =
@@ -1423,7 +1925,7 @@ impl TransferService {
             .set_error(id, AppError::Provider(summary))
             .await;
         Ok(ExecutionOutcome {
-            transferred_bytes: 0,
+            transferred_bytes: completed_bytes,
             completed_items,
             failed_items,
             cleanup_required_items: 0,
@@ -1497,13 +1999,16 @@ impl TransferService {
             &HashSet::new(),
             settings.preserve_empty_folders,
         )?;
-        let _ = write_mapping_manifest(
+        let manifest_path = write_mapping_manifest(
             &destination_root,
             &profile.id.to_string(),
             &bucket,
             &source_prefix,
             &plan,
         )?;
+        self.manager
+            .set_mapping_manifest_path(id, manifest_path.to_string_lossy().to_string())
+            .await?;
         let executor = S3RecursiveExecutor {
             client,
             manager: self.manager.clone(),
@@ -1927,16 +2432,7 @@ impl S3RecursiveExecutor {
         size: u64,
         metadata: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
-        let part_size = self
-            .settings
-            .initial_part_size_bytes
-            .clamp(5 * 1024 * 1024, 5 * 1024 * 1024 * 1024)
-            .min(MAX_IN_MEMORY_PART_BYTES);
-        if size.div_ceil(part_size) > 10_000 {
-            return Err(AppError::Validation(
-                "object requires too many multipart parts".to_string(),
-            ));
-        }
+        let part_size = effective_multipart_part_size(self.settings.initial_part_size_bytes, size)?;
         let mut upload_builder = self
             .client
             .create_multipart_upload()
@@ -2083,49 +2579,102 @@ impl S3RecursiveExecutor {
             ));
         };
         let destination = PathBuf::from(path);
+        ensure_local_path_not_reparse(&destination)?;
         if item.is_directory {
             fs::create_dir_all(&destination).await?;
             return Ok(0);
         }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
+            ensure_local_path_not_reparse(&destination)?;
         }
-        let output = self
+        let head = self
             .client
-            .get_object()
+            .head_object()
             .bucket(bucket)
             .key(key)
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-        let expected = output.content_length().unwrap_or(0).max(0) as u64;
+        let expected = head.content_length().unwrap_or(0).max(0) as u64;
+        let remote_etag = head.e_tag().map(ToString::to_string);
         if item.size_bytes.is_some_and(|planned| planned != expected) {
             return Err(AppError::Provider(
                 "download integrity check failed: object size changed".to_string(),
             ));
         }
-        let partial = partial_path(&destination, Uuid::new_v4());
+        let partial = partial_path(&destination, self.transfer_id);
         let result = async {
-            let mut file = File::create(&partial).await?;
-            let mut stream = output.body.into_async_read();
-            let mut buffer = vec![0_u8; 1024 * 1024];
-            let mut transferred = 0_u64;
+            let mut transferred = fs::metadata(&partial)
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if transferred > expected {
+                transferred = 0;
+                let _ = fs::remove_file(&partial).await;
+            }
             loop {
-                self.manager.checkpoint(self.transfer_id).await?;
-                let count = stream.read(&mut buffer).await?;
-                if count == 0 {
+                let _ = self.manager.checkpoint(self.transfer_id).await?;
+                if transferred == expected {
                     break;
                 }
-                file.write_all(&buffer[..count]).await?;
-                transferred = transferred.saturating_add(count as u64);
+                let mut request = self.client.get_object().bucket(bucket).key(key);
+                if transferred > 0 {
+                    request = request.range(format!("bytes={transferred}-"));
+                }
+                let output = request
+                    .send()
+                    .await
+                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                let response_size = output
+                    .content_length()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default();
+                if remote_etag.as_deref() != output.e_tag() {
+                    return Err(AppError::Provider(
+                        "download integrity check failed: remote object identity changed"
+                            .to_string(),
+                    ));
+                }
+                if transferred.saturating_add(response_size) != expected {
+                    return Err(AppError::Provider(
+                        "download integrity check failed: range response changed".to_string(),
+                    ));
+                }
+                let mut file = if transferred > 0 {
+                    fs::OpenOptions::new().append(true).open(&partial).await?
+                } else {
+                    File::create(&partial).await?
+                };
+                let mut stream = output.body.into_async_read();
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                let mut paused = false;
+                loop {
+                    if self.manager.checkpoint(self.transfer_id).await? {
+                        paused = true;
+                        break;
+                    }
+                    let count = stream.read(&mut buffer).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    file.write_all(&buffer[..count]).await?;
+                    transferred = transferred.saturating_add(count as u64);
+                }
+                file.flush().await?;
+                drop(file);
+                if paused {
+                    // Resume from the validated local offset with a fresh
+                    // Range request rather than continuing a stale stream.
+                    continue;
+                }
+                if transferred != expected {
+                    return Err(AppError::Provider(
+                        "download integrity check failed: content length mismatch".to_string(),
+                    ));
+                }
             }
-            file.flush().await?;
-            drop(file);
-            if expected != transferred {
-                return Err(AppError::Provider(
-                    "download integrity check failed: content length mismatch".to_string(),
-                ));
-            }
+            ensure_local_path_not_reparse(&destination)?;
             if destination.exists() {
                 fs::remove_file(&destination).await?;
             }
@@ -2253,6 +2802,7 @@ impl S3RecursiveExecutor {
         replace_metadata: bool,
         replacement: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
+        let part_size = effective_multipart_part_size(MULTIPART_COPY_PART_BYTES, source_size)?;
         let ranges = multipart_copy_ranges(source_size)?;
         let mut create = self
             .client
@@ -2317,7 +2867,7 @@ impl S3RecursiveExecutor {
                 destination_bucket,
                 destination_key,
                 &upload_id,
-                MULTIPART_COPY_PART_BYTES,
+                part_size,
             )
             .await
         {
@@ -2558,6 +3108,29 @@ fn local_path(endpoint: &TransferEndpoint) -> Result<PathBuf, AppError> {
     }
     validate_local_path_length(Path::new(path))?;
     Ok(PathBuf::from(path))
+}
+
+fn local_endpoint_has_directory_hint(endpoint: &TransferEndpoint) -> bool {
+    matches!(
+        endpoint,
+        TransferEndpoint::Local { path }
+            if path.ends_with('/') || path.ends_with('\\')
+    )
+}
+
+fn ensure_local_path_not_reparse(path: &Path) -> Result<(), AppError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                return Err(AppError::Validation(
+                    "download destination contains a symbolic link or reparse point".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_available_disk_space(directory: &Path, required_bytes: u64) -> Result<(), AppError> {
@@ -2915,7 +3488,18 @@ mod tests {
         assert_eq!(ranges[0], (1, 0, part_bytes - 1));
         assert_eq!(ranges[1], (2, part_bytes, part_bytes * 2 - 1));
         assert_eq!(ranges[2], (3, part_bytes * 2, part_bytes * 2 + 6));
-        assert!(multipart_copy_ranges(part_bytes * 10_001).is_err());
+        let expanded = multipart_copy_ranges(part_bytes * 10_001).unwrap();
+        assert_eq!(expanded.len(), 10_000);
+        assert!(expanded.windows(2).all(|pair| pair[0].2 + 1 == pair[1].1));
+    }
+
+    #[test]
+    fn multipart_part_size_grows_before_part_limit() {
+        let size = 5 * 1024 * 1024 * 1024 * 1024_u64;
+        let part_size = effective_multipart_part_size(16 * 1024 * 1024, size).unwrap();
+        assert!(part_size >= size.div_ceil(MAX_MULTIPART_PARTS));
+        assert!(size.div_ceil(part_size) <= MAX_MULTIPART_PARTS);
+        assert!(part_size <= MAX_IN_MEMORY_PART_BYTES);
     }
 
     #[test]
@@ -2943,5 +3527,41 @@ mod tests {
             upload_content_type(Path::new("photo.png"), Some(&metadata)).as_deref(),
             Some("application/x-custom")
         );
+    }
+
+    #[test]
+    fn delete_confirmation_is_required_at_the_command_boundary() {
+        assert!(require_delete_confirmation("", Some("DELETE")).is_err());
+        assert!(require_delete_confirmation("NO", Some("DELETE")).is_err());
+        assert!(require_delete_confirmation("DELETE", Some("DELETE")).is_ok());
+        // Small recursive deletes still need an acknowledgement even though
+        // they do not require the stronger typed-prefix token.
+        assert!(require_delete_confirmation("", None).is_err());
+        assert!(require_delete_confirmation("confirm", None).is_ok());
+    }
+
+    #[test]
+    fn recursive_delete_confirmation_uses_the_exact_prefix_for_large_jobs() {
+        assert!(require_delete_confirmation("DELETE folder", Some("DELETE folder")).is_ok());
+        assert!(require_delete_confirmation("DELETE folder/", Some("DELETE folder")).is_err());
+    }
+
+    #[test]
+    fn download_directory_hint_accepts_trailing_separators() {
+        assert!(local_endpoint_has_directory_hint(
+            &TransferEndpoint::Local {
+                path: "C:\\Downloads\\".to_string(),
+            }
+        ));
+        assert!(local_endpoint_has_directory_hint(
+            &TransferEndpoint::Local {
+                path: "C:/Downloads/".to_string(),
+            }
+        ));
+        assert!(!local_endpoint_has_directory_hint(
+            &TransferEndpoint::Local {
+                path: "C:\\Downloads\\file.txt".to_string(),
+            }
+        ));
     }
 }

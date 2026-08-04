@@ -16,6 +16,7 @@ The protected release job supplies the following environment values:
 | `S3FM_RELEASE_NOTES` | Human-readable release notes |
 | `S3FM_UPDATE_MANIFEST_URL_STABLE` | HTTPS stable manifest URL |
 | `S3FM_UPDATE_MANIFEST_URL_BETA` | HTTPS beta manifest URL |
+| `S3FM_UPDATE_ARTIFACT_BASE_URL` | HTTPS directory where the signed updater archive is published |
 | `S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64` | HTTPS URL for the signed Windows updater archive |
 | `TAURI_UPDATER_PUBLIC_KEY` | Public key embedded in the generated Tauri config |
 | `TAURI_SIGNING_PRIVATE_KEY` | Protected Tauri updater signing key |
@@ -23,6 +24,7 @@ The protected release job supplies the following environment values:
 | `TAURI_UPDATER_SIGNATURE_WINDOWS_X86_64` | Signature produced by the Tauri signing step |
 | `WINDOWS_CERTIFICATE_THUMBPRINT` | SHA-1 thumbprint of the Authenticode certificate installed on the runner |
 | `WINDOWS_TIMESTAMP_URL` | Optional HTTPS timestamp service |
+| `WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD` | Optional base64-encoded PFX and password imported by the protected workflow |
 
 `WINDOWS_SIGNING_CERTIFICATE_PATH` and
 `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` may be provided together when the
@@ -59,3 +61,27 @@ This verifies the NSIS configuration and that the expected non-empty installer
 artifact exists. Clean-VM installation, WebView2 offline behavior, signature
 tamper rejection, and uninstall-data preservation remain release-runner tests
 because they require a Windows VM and protected signing material.
+
+The protected workflow validates the build overlay first with
+`node scripts/validate-release-config.mjs --strict --config-only`. The Tauri
+build creates the updater archive and its `.sig` file; only then does the
+workflow derive `S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64` and generate the
+static channel manifest. This avoids inventing a signature before protected
+signing runs.
+
+The manual workflow is `.github/workflows/release.yml`. It uploads the
+installer, updater archive, signature, and manifest as a CI artifact. A
+deployment job or release host must publish them at the configured HTTPS URLs;
+stable and beta manifest URLs are intentionally separate.
+
+The optional `updater` Cargo feature is enabled only by that protected
+workflow. Development/PR binaries return a typed “not configured” result from
+Check updates and cannot install an update. Release binaries use the Tauri
+updater plugin, verify the embedded public key and manifest signature, require
+the exact `INSTALL UPDATE <version>` confirmation phrase, and check active
+transfers both before download and immediately before installation.
+
+An Authenticode certificate must be installed in the runner's CurrentUser
+certificate store (or supplied as the documented PFX path/password pair). No
+secret values belong in repository files, generated overlays, logs, or
+diagnostics exports.

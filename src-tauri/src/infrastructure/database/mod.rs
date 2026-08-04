@@ -1237,6 +1237,7 @@ fn persisted_transfer_from_row(row: &SqliteRow) -> Result<PersistedTransfer, App
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         error,
+        mapping_manifest_path: None,
     };
     let mut request = request_from_job(&job);
     request.settings_snapshot = row
@@ -1261,6 +1262,7 @@ fn request_from_job(job: &TransferJob) -> StartTransferRequest {
         total_bytes: job.total_bytes,
         total_items: job.total_items,
         confirmation: None,
+        delete_keys: None,
         recursive: matches!(
             job.operation,
             TransferOperation::UploadDirectory
@@ -1274,6 +1276,7 @@ fn request_from_job(job: &TransferJob) -> StartTransferRequest {
                 TransferEndpoint::Remote { key, .. }
             ) if key.ends_with('/')
         ),
+        cleanup_only: false,
         metadata: None,
         preserve_root: false,
         replace_metadata: false,
@@ -1317,6 +1320,7 @@ fn parse_transfer_status(value: &str, fallback: &str) -> Result<TransferStatus, 
         "cancelling" | "canceling" => Ok(TransferStatus::Cancelling),
         "completed" => Ok(TransferStatus::Completed),
         "completedWithWarnings" => Ok(TransferStatus::CompletedWithWarnings),
+        "cleanupRequired" => Ok(TransferStatus::CompletedWithWarnings),
         "failed" => Ok(TransferStatus::Failed),
         "cancelled" | "canceled" => Ok(TransferStatus::Cancelled),
         "interrupted" => Ok(TransferStatus::Interrupted),

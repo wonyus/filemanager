@@ -1,0 +1,123 @@
+name: Protected Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver release version (for example 1.2.3)
+        required: true
+        type: string
+      channel:
+        description: Signed update channel
+        required: true
+        default: stable
+        type: choice
+        options: [stable, beta]
+      notes:
+        description: Release notes shown before installation
+        required: false
+        default: Security and reliability fixes
+        type: string
+
+permissions:
+  contents: read
+
+# This workflow intentionally has no fallback values for signing material or
+# deployment URLs.  It must run in a protected GitHub environment with the
+# secrets documented in release-hardening.md.
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    environment: protected-release
+    env:
+      S3FM_RELEASE_VERSION: ${{ inputs.version }}
+      S3FM_RELEASE_CHANNEL: ${{ inputs.channel }}
+      S3FM_RELEASE_NOTES: ${{ inputs.notes }}
+      S3FM_RELEASE_PUB_DATE: ${{ github.event.repository.updated_at }}
+      S3FM_UPDATE_MANIFEST_URL_STABLE: ${{ secrets.S3FM_UPDATE_MANIFEST_URL_STABLE }}
+      S3FM_UPDATE_MANIFEST_URL_BETA: ${{ secrets.S3FM_UPDATE_MANIFEST_URL_BETA }}
+      S3FM_UPDATE_ARTIFACT_BASE_URL: ${{ secrets.S3FM_UPDATE_ARTIFACT_BASE_URL }}
+      TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+      WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_SIGNING_CERTIFICATE_PATH: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PATH }}
+      WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: pnpm install --frozen-lockfile
+      - name: Import base64 Authenticode certificate when supplied
+        if: ${{ env.WINDOWS_CERTIFICATE != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP 's3fm-certificate'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          $encoded = Join-Path $directory 'certificate.txt'
+          $pfx = Join-Path $directory 'certificate.pfx'
+          [IO.File]::WriteAllText($encoded, $env:WINDOWS_CERTIFICATE)
+          certutil -decode $encoded $pfx | Out-Null
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+          Remove-Item -LiteralPath $encoded, $pfx -Force
+      - name: Import protected Authenticode certificate when supplied
+        if: ${{ env.WINDOWS_SIGNING_CERTIFICATE_PATH != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $env:WINDOWS_SIGNING_CERTIFICATE_PATH -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+      - name: Validate protected release inputs
+        # The archive signature is produced by the build, so the manifest
+        # phase is validated after the updater artifact exists.
+        run: node scripts/validate-release-config.mjs --strict --config-only
+      - name: Generate release Tauri overlay
+        run: pnpm release:tauri-config
+      - name: Build signed MSVC NSIS and updater artifacts
+        run: pnpm tauri build --bundles nsis --features updater --config dist/tauri.release.conf.json
+      - name: Derive updater URL and generate signed manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem src-tauri/target/release/bundle -Recurse -File -Filter '*.zip' | Where-Object { $_.Name -notlike '*.sig' } | Select-Object -First 1
+          if (-not $zip) { throw 'Tauri updater archive was not generated' }
+          $sigPath = "$($zip.FullName).sig"
+          if (-not (Test-Path -LiteralPath $sigPath)) { throw "Updater signature was not generated: $sigPath" }
+          $signature = (Get-Content -LiteralPath $sigPath -Raw).Trim()
+          if (-not $signature) { throw 'Updater signature is empty' }
+          $baseValue = $env:S3FM_UPDATE_ARTIFACT_BASE_URL.Trim()
+          if (-not $baseValue -or $baseValue -match 'example\.invalid|localhost|127\.0\.0\.1') { throw 'S3FM_UPDATE_ARTIFACT_BASE_URL is not configured' }
+          try { $baseUrl = [Uri]$baseValue } catch { throw 'S3FM_UPDATE_ARTIFACT_BASE_URL must be an absolute HTTPS URL' }
+          if (-not $baseUrl.IsAbsoluteUri -or $baseUrl.Scheme -ne 'https' -or $baseUrl.UserInfo -or $baseUrl.Query -or $baseUrl.Fragment) { throw 'S3FM_UPDATE_ARTIFACT_BASE_URL must be an absolute HTTPS URL without credentials, query, or fragment' }
+          $base = $baseUrl.AbsoluteUri.TrimEnd('/')
+          $encodedName = [Uri]::EscapeDataString($zip.Name)
+          "S3FM_UPDATE_ARTIFACT_URL_WINDOWS_X86_64=$base/$encodedName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TAURI_UPDATER_SIGNATURE_WINDOWS_X86_64=$signature" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "S3FM_RELEASE_PUB_DATE=$([DateTime]::UtcNow.ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Generate signed update manifest
+        run: pnpm release:manifest
+      - name: Verify NSIS installer
+        run: pnpm verify:installer -- --required
+      - name: Upload release artifacts for deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-file-manager-${{ inputs.channel }}-${{ inputs.version }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/**/*.zip
+            src-tauri/target/release/bundle/**/*.sig
+            dist/updater/*.json

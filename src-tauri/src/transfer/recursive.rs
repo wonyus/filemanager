@@ -424,11 +424,12 @@ fn walk_local_directory(
         child_count += 1;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path).map_err(AppError::Io)?;
-        if metadata.file_type().is_symlink() {
-            return Err(AppError::Validation(format!(
-                "symbolic links are not allowed in recursive uploads: {}",
-                path.display()
-            )));
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            // Unsafe links/reparse points are intentionally excluded from the
+            // plan rather than followed or turning an otherwise safe folder
+            // upload into a hard failure. The skipped path remains outside
+            // the transfer item list.
+            continue;
         }
         ensure_local_descendant(root, &path)?;
         if metadata.is_dir() {
@@ -740,13 +741,13 @@ fn ensure_local_descendant(root: &Path, candidate: &Path) -> Result<(), AppError
 }
 
 #[cfg(windows)]
-fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(not(windows))]
-fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 

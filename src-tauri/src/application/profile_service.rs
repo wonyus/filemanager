@@ -2208,6 +2208,13 @@ fn profile_from_draft(
         }
     }
     let provider = draft.provider;
+    if provider == crate::domain::provider::ProviderType::CloudflareR2
+        && draft.credential_mode == crate::domain::provider::CredentialMode::TemporarySession
+    {
+        return Err(AppError::Validation(
+            "Cloudflare R2 standard credentials do not support session tokens".to_string(),
+        ));
+    }
     let region = if draft.region.trim().is_empty() {
         provider.default_region().to_string()
     } else {
@@ -2282,16 +2289,12 @@ fn profile_from_draft(
             "AWS S3 uses its managed endpoint; choose Custom S3 for a custom endpoint".to_string(),
         ));
     }
-    if matches!(
-        provider,
-        crate::domain::provider::ProviderType::CloudflareR2
-            | crate::domain::provider::ProviderType::Wasabi
-    ) && explicit_endpoint.is_some()
+    if provider == crate::domain::provider::ProviderType::Wasabi
+        && explicit_endpoint.is_some()
         && explicit_endpoint != derived_endpoint
     {
         return Err(AppError::Validation(
-            "The selected provider controls its endpoint; choose Custom S3 for a different gateway"
-                .to_string(),
+            "Wasabi endpoint must match the selected region preset".to_string(),
         ));
     }
     if provider == crate::domain::provider::ProviderType::Wasabi {

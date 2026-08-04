@@ -107,7 +107,8 @@ pub fn classify_error(error: &AppError) -> RetryClass {
         | AppError::LocalPermissionDenied
         | AppError::LocalPathTooLong
         | AppError::LocalDiskFull
-        | AppError::LocalFileChanged => RetryClass::NonRetryable,
+        | AppError::LocalFileChanged
+        | AppError::UpdateVerificationFailed(_) => RetryClass::NonRetryable,
         AppError::NetworkUnavailable | AppError::RequestTimedOut => RetryClass::Retryable,
         AppError::Provider(message) => classify_provider_message(message),
         AppError::Unknown(message) => classify_provider_message(message),

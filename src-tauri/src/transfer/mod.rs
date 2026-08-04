@@ -36,6 +36,7 @@ struct RuntimeJob {
     cancel_requested: bool,
     pause_requested: bool,
     last_progress_at: Option<Instant>,
+    last_progress_emit_at: Option<Instant>,
     last_progress_bytes: u64,
     ewma_speed_bps: Option<f64>,
 }
@@ -184,6 +185,7 @@ impl TransferManager {
                 cancel_requested: false,
                 pause_requested: false,
                 last_progress_at: None,
+                last_progress_emit_at: None,
                 last_progress_bytes: 0,
                 ewma_speed_bps: None,
                 job: transfer.job,
@@ -243,6 +245,7 @@ impl TransferManager {
             started_at: None,
             finished_at: None,
             error: None,
+            mapping_manifest_path: None,
         };
         self.jobs.write().await.insert(
             job.id,
@@ -252,6 +255,7 @@ impl TransferManager {
                 cancel_requested: false,
                 pause_requested: false,
                 last_progress_at: None,
+                last_progress_emit_at: None,
                 last_progress_bytes: 0,
                 ewma_speed_bps: None,
             },
@@ -522,6 +526,18 @@ impl TransferManager {
         Ok(next)
     }
 
+    /// Mark a compound move retry as cleanup-only before cloning its request.
+    /// This flag is set only by the Rust retry command after a completed-copy
+    /// warning; renderer-created requests are never trusted to skip copying.
+    pub async fn mark_cleanup_retry(&self, id: Uuid) -> Result<(), AppError> {
+        let mut jobs = self.jobs.write().await;
+        let runtime = jobs
+            .get_mut(&id)
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        runtime.request.cleanup_only = true;
+        Ok(())
+    }
+
     pub async fn transition(
         &self,
         id: Uuid,
@@ -713,11 +729,27 @@ impl TransferManager {
             speed_bps: effective_speed,
             eta_seconds: effective_eta,
         };
+        let progress_interval = request
+            .settings_snapshot
+            .as_ref()
+            .map(|settings| {
+                Duration::from_millis((1_000_u64 / u64::from(settings.progress_hz.max(1))).max(1))
+            })
+            .unwrap_or_else(|| Duration::from_millis(200));
+        let should_emit = runtime
+            .last_progress_emit_at
+            .map(|previous| now.duration_since(previous) >= progress_interval)
+            .unwrap_or(true);
+        if should_emit {
+            runtime.last_progress_emit_at = Some(now);
+        }
         drop(jobs);
-        self.persist_snapshot(&job, &request).await;
-        let _ = self
-            .events
-            .send(TransferChannelMessage::Progress(progress.clone()));
+        if should_emit {
+            self.persist_snapshot(&job, &request).await;
+            let _ = self
+                .events
+                .send(TransferChannelMessage::Progress(progress.clone()));
+        }
         Ok(progress)
     }
 
@@ -755,6 +787,20 @@ impl TransferManager {
             .get_mut(&id)
             .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
         runtime.job.error = Some(public_error);
+        let snapshot = runtime.job.clone();
+        let request = runtime.request.clone();
+        drop(jobs);
+        self.persist_snapshot(&snapshot, &request).await;
+        let _ = self.events.send(TransferChannelMessage::Snapshot(snapshot));
+        Ok(())
+    }
+
+    pub async fn set_mapping_manifest_path(&self, id: Uuid, path: String) -> Result<(), AppError> {
+        let mut jobs = self.jobs.write().await;
+        let runtime = jobs
+            .get_mut(&id)
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        runtime.job.mapping_manifest_path = Some(path);
         let snapshot = runtime.job.clone();
         let request = runtime.request.clone();
         drop(jobs);
@@ -802,6 +848,7 @@ impl TransferManager {
             failed_items,
             cleanup_required_items,
             error: final_job.error.clone(),
+            mapping_manifest_path: final_job.mapping_manifest_path.clone(),
         };
         let _ = self
             .events
@@ -1134,7 +1181,9 @@ mod tests {
             total_bytes: Some(10),
             total_items: Some(1),
             confirmation: None,
+            delete_keys: None,
             recursive: false,
+            cleanup_only: false,
             preserve_root: false,
             replace_metadata: false,
             metadata: None,
