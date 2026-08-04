@@ -4,10 +4,13 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
 } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands, formatCommandError } from "./lib/commands";
 import { useAppStore } from "./stores/appStore";
 import type {
@@ -83,6 +86,92 @@ function draftFromProfile(profile: ProfileDetail): ProfileDraft {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function importedProfileDraft(value: unknown): ProfileDraft {
+  if (!isRecord(value)) throw new Error("Profile entry must be an object.");
+  const providerAliases: Record<string, ProviderType> = {
+    awsS3: "awsS3",
+    "aws-s3": "awsS3",
+    cloudflareR2: "cloudflareR2",
+    "cloudflare-r2": "cloudflareR2",
+    minio: "minio",
+    wasabi: "wasabi",
+    customS3: "customS3",
+    "custom-s3": "customS3",
+  };
+  const providerValue = String(value.provider ?? "");
+  const provider = providerAliases[providerValue];
+  if (!provider) throw new Error(`Unsupported provider: ${providerValue}`);
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  if (!name) throw new Error("Imported profile name is required.");
+  const addressingStyle =
+    value.addressingStyle === "path" || value.forcePathStyle === true
+      ? "path"
+      : "virtualHosted";
+  return {
+    schemaVersion: 1,
+    name,
+    provider,
+    accountId:
+      typeof value.accountId === "string" ? value.accountId : undefined,
+    endpoint: typeof value.endpoint === "string" ? value.endpoint : undefined,
+    region: typeof value.region === "string" ? value.region : "",
+    credentialMode:
+      value.credentialMode === "temporarySession"
+        ? "temporarySession"
+        : "static",
+    defaultBucket:
+      typeof value.defaultBucket === "string" ? value.defaultBucket : undefined,
+    rootPrefix:
+      typeof value.rootPrefix === "string" ? value.rootPrefix : undefined,
+    addressingStyle,
+    // Browser fallback imports are treated as untrusted input; plaintext HTTP
+    // must be explicitly re-enabled in the profile editor.
+    allowInsecureHttp: false,
+    favorite: value.favorite === true,
+  };
+}
+
+function downloadJson(filename: string, value: unknown) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+interface SavedLocation extends ExplorerLocation {
+  id: string;
+  name: string;
+  visitedAt: string;
+}
+
+function readSavedLocations(storageKey: string): SavedLocation[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (item): item is SavedLocation =>
+        isRecord(item) &&
+        typeof item.id === "string" &&
+        typeof item.name === "string" &&
+        typeof item.profileId === "string" &&
+        typeof item.bucket === "string" &&
+        typeof item.prefix === "string" &&
+        typeof item.visitedAt === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
 function App() {
   const {
     appInfo,
@@ -130,12 +219,44 @@ function App() {
   const [editingProfile, setEditingProfile] = useState<ProfileDetail | null>(
     null,
   );
+  const [importDraft, setImportDraft] = useState<ProfileDraft | null>(null);
+  const [importQueue, setImportQueue] = useState<ProfileDraft[]>([]);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const profileImportRef = useRef<HTMLInputElement>(null);
+  const transferStatusRef = useRef<Record<string, string>>({});
   const [activeSection, setActiveSection] = useState("profiles");
 
   useEffect(() => {
     void bootstrap();
     void refreshTransfers();
   }, [bootstrap, refreshTransfers]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<number>("transfer-close-requested", async ({ payload }) => {
+      if (disposed) return;
+      const confirmed = window.confirm(
+        `${payload} transfer${payload === 1 ? " is" : "s are"} active. Stop them and close?`,
+      );
+      if (!confirmed) return;
+      try {
+        await commands.interruptActiveTransfers();
+        await getCurrentWindow().close();
+      } catch (closeError) {
+        window.alert(formatCommandError(closeError));
+      }
+    })
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     const expiryTimes = [preview?.expiresAt, shareLink?.expiresAt]
@@ -176,14 +297,159 @@ function App() {
     return () => window.clearInterval(timer);
   }, [transfers, refreshTransfers]);
 
+  useEffect(() => {
+    if (!location || !transfers) return;
+    const terminal = new Set([
+      "completed",
+      "completedWithWarnings",
+      "failed",
+      "cancelled",
+      "interrupted",
+    ]);
+    let shouldRefresh = false;
+    for (const job of transfers.items) {
+      const previous = transferStatusRef.current[job.id];
+      if (terminal.has(job.status) && previous && previous !== job.status) {
+        shouldRefresh = true;
+      }
+      transferStatusRef.current[job.id] = job.status;
+    }
+    if (shouldRefresh) void listEntries(location);
+  }, [listEntries, location, transfers]);
+
   const openEditor = (profile?: ProfileDetail) => {
     setEditingProfile(profile ?? null);
+    setImportDraft(null);
+    setImportQueue([]);
     setEditorOpen(true);
+  };
+
+  const exportProfiles = async () => {
+    if (profiles.length === 0) return;
+    setProfileNotice(null);
+    try {
+      const destinationPath = window.prompt(
+        "Export path (leave blank to download in the browser):",
+        "s3-file-manager-profiles.json",
+      );
+      if (destinationPath?.trim()) {
+        const result = await commands.exportProfiles(
+          profiles.map((profile) => profile.id),
+          destinationPath.trim(),
+        );
+        setProfileNotice(
+          `Exported ${result.profileCount} profile${result.profileCount === 1 ? "" : "s"} to ${result.path}. Secrets were excluded.`,
+        );
+        return;
+      }
+      const details = await Promise.all(
+        profiles.map((profile) => commands.getProfile(profile.id)),
+      );
+      downloadJson("s3-file-manager-profiles.json", {
+        schemaVersion: 1,
+        exportedAt: new Date().toISOString(),
+        application: "S3 File Manager",
+        profiles: details.map((detail) => ({
+          exportId: detail.id,
+          name: detail.name,
+          provider: detail.provider,
+          endpoint: detail.endpoint,
+          region: detail.region,
+          credentialMode: detail.credentialMode,
+          defaultBucket: detail.defaultBucket,
+          rootPrefix: detail.rootPrefix,
+          addressingStyle: detail.addressingStyle,
+          allowInsecureHttp: detail.allowInsecureHttp,
+          favorite: detail.favorite,
+          hasCredentials: detail.hasSecretAccessKey || detail.hasSessionToken,
+        })),
+      });
+      setProfileNotice(
+        `Exported ${details.length} profile${details.length === 1 ? "" : "s"}. Secrets were excluded.`,
+      );
+    } catch (error) {
+      setProfileNotice(formatCommandError(error));
+    }
+  };
+
+  const importProfiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const sourcePath = (file as File & { path?: string }).path;
+      if (sourcePath?.trim()) {
+        const result = await commands.importProfiles(sourcePath);
+        await bootstrap();
+        const rejected = result.rejected.length
+          ? ` ${result.rejected.length} profile${result.rejected.length === 1 ? " was" : "s were"} rejected.`
+          : "";
+        setProfileNotice(
+          `Imported ${result.imported.length} profile${result.imported.length === 1 ? "" : "s"}.${rejected} Add credentials before connecting.`,
+        );
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        throw new Error("The profile export exceeds the 2 MiB safety limit.");
+      }
+      const parsed: unknown = JSON.parse(await file.text());
+      if (!isRecord(parsed) || parsed.schemaVersion !== 1) {
+        throw new Error("Unsupported profile export schema.");
+      }
+      if (
+        !Array.isArray(parsed.profiles) ||
+        parsed.profiles.length === 0 ||
+        parsed.profiles.length > 100
+      ) {
+        throw new Error(
+          "The profile export must contain between 1 and 100 profiles.",
+        );
+      }
+      const drafts = parsed.profiles.map((entry) =>
+        importedProfileDraft(entry),
+      );
+      setEditingProfile(null);
+      setImportDraft(drafts[0]);
+      setImportQueue(drafts.slice(1));
+      setEditorOpen(true);
+      setProfileNotice(
+        drafts.length === 1
+          ? "Imported profile settings. Add credentials before saving."
+          : `Loaded ${drafts.length} profiles. Add credentials and save each profile in sequence.`,
+      );
+    } catch (error) {
+      setProfileNotice(
+        error instanceof Error ? error.message : "Invalid profile export.",
+      );
+    }
+  };
+
+  const toggleFavorite = async (summary: ProfileSummary) => {
+    try {
+      const detail =
+        activeProfile?.id === summary.id
+          ? activeProfile
+          : await commands.getProfile(summary.id);
+      await saveProfile(
+        { ...draftFromProfile(detail), favorite: !detail.favorite },
+        detail.id,
+        detail.revision,
+      );
+    } catch (error) {
+      setProfileNotice(formatCommandError(error));
+    }
   };
 
   const chooseProfile = async (profile: ProfileSummary) => {
     await selectProfile(profile.id);
     await listBuckets(profile.id);
+    if (profile.defaultBucket) {
+      await openExplorer({
+        profileId: profile.id,
+        bucket: profile.defaultBucket,
+        prefix: profile.rootPrefix,
+      });
+    }
   };
 
   const handleDelete = async (profile: ProfileSummary) => {
@@ -315,10 +581,39 @@ function App() {
                   demand.
                 </p>
               </div>
-              <span className="rounded-full bg-canvas px-3 py-1 text-xs font-medium text-muted">
-                Secure by design
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  ref={profileImportRef}
+                  className="hidden"
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={importProfiles}
+                />
+                <button
+                  className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas disabled:opacity-50"
+                  type="button"
+                  onClick={() => void exportProfiles()}
+                  disabled={profiles.length === 0 || loading}
+                >
+                  Export profiles
+                </button>
+                <button
+                  className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas"
+                  type="button"
+                  onClick={() => profileImportRef.current?.click()}
+                >
+                  Import profiles
+                </button>
+              </div>
             </div>
+            {profileNotice && (
+              <p
+                className="mb-4 rounded-xl bg-canvas px-3 py-2 text-xs text-muted"
+                role="status"
+              >
+                {profileNotice}
+              </p>
+            )}
             {loading && profiles.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-border p-10 text-center text-sm text-muted">
                 Loading local state…
@@ -346,6 +641,7 @@ function App() {
                     }}
                     onDuplicate={() => void duplicateProfile(profile.id)}
                     onDelete={() => void handleDelete(profile)}
+                    onToggleFavorite={() => void toggleFavorite(profile)}
                   />
                 ))}
               </div>
@@ -374,6 +670,15 @@ function App() {
             onOpenPrefix={(prefix) => {
               if (location) void openExplorer({ ...location, prefix });
             }}
+            onOpenLocation={(nextLocation) => {
+              if (selectedProfileId !== nextLocation.profileId) {
+                void selectProfile(nextLocation.profileId).then(() =>
+                  openExplorer(nextLocation),
+                );
+              } else {
+                void openExplorer(nextLocation);
+              }
+            }}
             onRefresh={() => {
               if (location) void listEntries(location);
             }}
@@ -385,6 +690,19 @@ function App() {
                 bucket: location.bucket,
                 key: entry.key,
               });
+            }}
+            onOpenFile={async (entry) => {
+              if (!location) return;
+              const request = {
+                schemaVersion: 1,
+                profileId: location.profileId,
+                bucket: location.bucket,
+                key: entry.key,
+              };
+              const nextMetadata = await loadMetadata(request);
+              if (nextMetadata?.previewSupported) {
+                await loadPreview(request);
+              }
             }}
             onDeleteSelection={(entries) => {
               if (!location) return;
@@ -410,6 +728,47 @@ function App() {
                   recursive: entry.kind !== "file",
                 });
               }
+            }}
+            onCreateFolder={(name) => {
+              if (!location) return;
+              const cleanName = name.replace(/[\\/]/g, "").trim();
+              if (!cleanName) return;
+              void startTransfer({
+                schemaVersion: 1,
+                operation: "createFolder",
+                profileId: location.profileId,
+                source: {
+                  kind: "remote",
+                  profileId: location.profileId,
+                  bucket: location.bucket,
+                  key: `${location.prefix}${cleanName}/`,
+                },
+                collisionPolicy: "fail",
+              });
+            }}
+            onRenameEntry={(entry, nextName) => {
+              if (!location) return;
+              const cleanName = nextName.replace(/[\\/]/g, "").trim();
+              if (!cleanName) return;
+              const folder = entry.kind !== "file";
+              void startTransfer({
+                schemaVersion: 1,
+                operation: folder ? "movePrefix" : "moveObject",
+                profileId: location.profileId,
+                source: {
+                  kind: "remote",
+                  profileId: location.profileId,
+                  bucket: location.bucket,
+                  key: entry.key,
+                },
+                destination: {
+                  kind: "remote",
+                  profileId: location.profileId,
+                  bucket: location.bucket,
+                  key: `${location.prefix}${cleanName}${folder ? "/" : ""}`,
+                },
+                collisionPolicy: "ask",
+              });
             }}
             onNextPage={() => {
               if (location && listing?.nextToken)
@@ -444,6 +803,14 @@ function App() {
               }
             }}
             onClosePreview={clearPreview}
+            onMetadataSaved={(nextMetadata) => {
+              void loadMetadata({
+                schemaVersion: 1,
+                profileId: nextMetadata.profileId,
+                bucket: nextMetadata.bucket,
+                key: nextMetadata.key,
+              });
+            }}
           />
 
           <TransfersPanel
@@ -482,14 +849,20 @@ function App() {
 
       {editorOpen && (
         <ProfileEditor
+          key={`${editingProfile?.id ?? "new"}:${importDraft?.name ?? ""}`}
           initial={
-            editingProfile ? draftFromProfile(editingProfile) : emptyDraft()
+            importDraft ??
+            (editingProfile ? draftFromProfile(editingProfile) : emptyDraft())
           }
           profile={editingProfile}
           saving={saving}
           testing={testing}
           testResult={testResult}
-          onClose={() => setEditorOpen(false)}
+          onClose={() => {
+            setEditorOpen(false);
+            setImportDraft(null);
+            setImportQueue([]);
+          }}
           onTest={(draft) => {
             const payload = { ...draft };
             if (!payload.secretAccessKey) delete payload.secretAccessKey;
@@ -510,8 +883,19 @@ function App() {
               editingProfile?.revision,
             );
             if (detail) {
-              setEditingProfile(detail);
-              setEditorOpen(false);
+              if (importQueue.length > 0) {
+                const [next, ...remaining] = importQueue;
+                setImportQueue(remaining);
+                setImportDraft(next);
+                setEditingProfile(null);
+                setProfileNotice(
+                  `Saved ${detail.name}. Add credentials for ${next.name} and save it next.`,
+                );
+              } else {
+                setEditingProfile(detail);
+                setImportDraft(null);
+                setEditorOpen(false);
+              }
             }
           }}
         />
@@ -558,6 +942,7 @@ function ProfileCard({
   onEdit,
   onDuplicate,
   onDelete,
+  onToggleFavorite,
 }: {
   profile: ProfileSummary;
   selected: boolean;
@@ -566,6 +951,7 @@ function ProfileCard({
   onEdit: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  onToggleFavorite: () => void;
 }) {
   return (
     <div
@@ -591,6 +977,14 @@ function ProfileCard({
           </p>
         </button>
         <div className="flex items-center gap-2">
+          <button
+            className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium hover:bg-canvas"
+            type="button"
+            onClick={onToggleFavorite}
+            disabled={busy}
+          >
+            {profile.favorite ? "Unfavorite" : "Favorite"}
+          </button>
           <button
             className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium hover:bg-canvas"
             type="button"
@@ -639,9 +1033,13 @@ function ExplorerPanel({
   onLoadBuckets,
   onOpenBucket,
   onOpenPrefix,
+  onOpenLocation,
   onRefresh,
   onSelectEntry,
+  onOpenFile,
   onDeleteSelection,
+  onCreateFolder,
+  onRenameEntry,
   onNextPage,
 }: {
   profile?: ProfileSummary;
@@ -657,9 +1055,13 @@ function ExplorerPanel({
   onLoadBuckets: () => void;
   onOpenBucket: (bucket: string) => void;
   onOpenPrefix: (prefix: string) => void;
+  onOpenLocation: (location: ExplorerLocation) => void;
   onRefresh: () => void;
   onSelectEntry: (entry: EntrySummary) => void;
+  onOpenFile: (entry: EntrySummary) => Promise<void>;
   onDeleteSelection: (entries: EntrySummary[]) => void;
+  onCreateFolder: (name: string) => void;
+  onRenameEntry: (entry: EntrySummary, nextName: string) => void;
   onNextPage: () => void;
 }) {
   type ViewMode = "list" | "grid";
@@ -673,6 +1075,12 @@ function ExplorerPanel({
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [backStack, setBackStack] = useState<ExplorerLocation[]>([]);
   const [forwardStack, setForwardStack] = useState<ExplorerLocation[]>([]);
+  const [bookmarks, setBookmarks] = useState<SavedLocation[]>(() =>
+    readSavedLocations("s3-file-manager-bookmarks-v1"),
+  );
+  const [recentLocations, setRecentLocations] = useState<SavedLocation[]>(() =>
+    readSavedLocations("s3-file-manager-recent-v1"),
+  );
   const scopeRef = useRef("");
 
   const rootPrefix = activeProfile?.rootPrefix ?? "";
@@ -693,6 +1101,86 @@ function ExplorerPanel({
     }
     scopeRef.current = scope;
   }, [location, scope]);
+
+  useEffect(() => {
+    if (!listing) return;
+    const available = new Set(listing.entries.map((entry) => entry.id));
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => available.has(id)));
+      return next.size === current.size ? current : next;
+    });
+    setFocusedId((current) =>
+      current && available.has(current) ? current : null,
+    );
+  }, [listing]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "s3-file-manager-bookmarks-v1",
+        JSON.stringify(bookmarks.slice(0, 100)),
+      );
+      localStorage.setItem(
+        "s3-file-manager-recent-v1",
+        JSON.stringify(recentLocations.slice(0, 30)),
+      );
+    } catch {
+      // Local persistence is best effort and never contains credentials.
+    }
+  }, [bookmarks, recentLocations]);
+
+  useEffect(() => {
+    if (!location) return;
+    const id = `${location.profileId}:${location.bucket}:${location.prefix}`;
+    setRecentLocations((items) =>
+      [
+        {
+          id,
+          name: `${location.bucket}/${location.prefix}`.replace(/\/$/, ""),
+          ...location,
+          visitedAt: new Date().toISOString(),
+        },
+        ...items.filter((item) => item.id !== id),
+      ].slice(0, 30),
+    );
+    void commands.recordRecentLocation(location).catch(() => {
+      // The local list remains a resilient fallback when the database is
+      // temporarily unavailable; it contains no secrets.
+    });
+  }, [location]);
+
+  useEffect(() => {
+    if (!profile?.id) return;
+    void Promise.all([
+      commands.listBookmarks(profile.id),
+      commands.listRecentLocations(profile.id),
+    ])
+      .then(([storedBookmarks, storedRecent]) => {
+        setBookmarks(
+          storedBookmarks.map((item) => ({
+            id: String(item.id),
+            name: item.name,
+            profileId: item.profileId,
+            bucket: item.bucket,
+            prefix: item.prefix,
+            visitedAt: item.createdAt,
+          })),
+        );
+        setRecentLocations(
+          storedRecent.map((item) => ({
+            id: `${item.profileId}:${item.bucket}:${item.prefix}`,
+            name: `${item.bucket}/${item.prefix}`.replace(/\/$/, ""),
+            profileId: item.profileId,
+            bucket: item.bucket,
+            prefix: item.prefix,
+            visitedAt: item.openedAt,
+          })),
+        );
+      })
+      .catch(() => {
+        // Keep the localStorage fallback if the profile database is offline.
+      });
+  }, [profile?.id]);
 
   const breadcrumbs = useMemo(() => {
     if (!location) return [];
@@ -805,7 +1293,7 @@ function ExplorerPanel({
 
   const activateEntry = (entry: EntrySummary) => {
     if (entry.kind === "file") {
-      onSelectEntry(entry);
+      void onOpenFile(entry);
       return;
     }
     navigatePrefix(entry.key.endsWith("/") ? entry.key : `${entry.key}/`);
@@ -887,6 +1375,16 @@ function ExplorerPanel({
     ) {
       event.preventDefault();
       goUp();
+    } else if (event.key === "F2") {
+      event.preventDefault();
+      renameSelection();
+    } else if (
+      (event.ctrlKey || event.metaKey) &&
+      event.shiftKey &&
+      event.key.toLowerCase() === "n"
+    ) {
+      event.preventDefault();
+      createFolder();
     } else if (
       (event.ctrlKey || event.metaKey) &&
       event.key.toLowerCase() === "a"
@@ -912,6 +1410,100 @@ function ExplorerPanel({
       setSortKey(next);
       setSortDescending(false);
     }
+  };
+
+  const bookmarkId = location
+    ? `${location.profileId}:${location.bucket}:${location.prefix}`
+    : "";
+  const existingBookmark = location
+    ? bookmarks.find(
+        (item) =>
+          item.profileId === location.profileId &&
+          item.bucket === location.bucket &&
+          item.prefix === location.prefix,
+      )
+    : undefined;
+  const isBookmarked = Boolean(existingBookmark);
+  const toggleBookmark = () => {
+    if (!location) return;
+    if (isBookmarked) {
+      setBookmarks((items) =>
+        items.filter((item) => item.id !== existingBookmark?.id),
+      );
+      const numericId = Number(existingBookmark?.id);
+      if (Number.isSafeInteger(numericId)) {
+        void commands.removeBookmark(numericId).catch(() => undefined);
+      }
+      return;
+    }
+    const defaultName = `${location.bucket}/${location.prefix}`.replace(
+      /\/$/,
+      "",
+    );
+    const name = window.prompt("Bookmark name", defaultName)?.trim();
+    if (!name) return;
+    void commands
+      .addBookmark({
+        schemaVersion: 1,
+        profileId: location.profileId,
+        bucket: location.bucket,
+        prefix: location.prefix,
+        name,
+      })
+      .then((stored) => {
+        setBookmarks((items) =>
+          [
+            {
+              id: String(stored.id),
+              name: stored.name,
+              profileId: stored.profileId,
+              bucket: stored.bucket,
+              prefix: stored.prefix,
+              visitedAt: stored.createdAt,
+            },
+            ...items.filter(
+              (item) =>
+                !(
+                  item.profileId === location.profileId &&
+                  item.bucket === location.bucket &&
+                  item.prefix === location.prefix
+                ),
+            ),
+          ].slice(0, 100),
+        );
+      })
+      .catch(() => {
+        setBookmarks((items) =>
+          [
+            {
+              id: bookmarkId,
+              name,
+              ...location,
+              visitedAt: new Date().toISOString(),
+            },
+            ...items.filter((item) => item.id !== bookmarkId),
+          ].slice(0, 100),
+        );
+      });
+  };
+
+  const selectedEntry =
+    selectedIds.size === 1
+      ? loadedEntries.find((entry) => selectedIds.has(entry.id))
+      : undefined;
+
+  const renameSelection = () => {
+    if (!selectedEntry) return;
+    const initialName = selectedEntry.displayName.replace(/\/$/, "");
+    const nextName = window.prompt("Rename selected item", initialName);
+    if (!nextName || nextName.trim() === initialName) return;
+    onRenameEntry(selectedEntry, nextName);
+  };
+
+  const createFolder = () => {
+    const name = window.prompt("New folder name")?.trim();
+    if (!name) return;
+    onCreateFolder(name);
   };
 
   return (
@@ -1002,6 +1594,58 @@ function ExplorerPanel({
             >
               Refresh
             </button>
+            <button
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-semibold hover:bg-canvas disabled:opacity-40"
+              type="button"
+              onClick={toggleBookmark}
+              disabled={loading}
+            >
+              {isBookmarked ? "★ Bookmarked" : "☆ Bookmark"}
+            </button>
+            <button
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-semibold hover:bg-canvas disabled:opacity-40"
+              type="button"
+              onClick={createFolder}
+              disabled={loading}
+            >
+              New folder
+            </button>
+            <select
+              className="max-w-[170px] rounded-lg border border-border bg-panel px-2 py-1.5 text-xs"
+              value=""
+              onChange={(event) => {
+                const item = bookmarks.find(
+                  (entry) => entry.id === event.target.value,
+                );
+                if (item) onOpenLocation(item);
+              }}
+              aria-label="Open bookmark"
+            >
+              <option value="">Bookmarks…</option>
+              {bookmarks.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+            <select
+              className="max-w-[170px] rounded-lg border border-border bg-panel px-2 py-1.5 text-xs"
+              value=""
+              onChange={(event) => {
+                const item = recentLocations.find(
+                  (entry) => entry.id === event.target.value,
+                );
+                if (item) onOpenLocation(item);
+              }}
+              aria-label="Open recent location"
+            >
+              <option value="">Recent locations…</option>
+              {recentLocations.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
             <div className="min-w-[220px] flex-1">
               <input
                 className="input w-full text-xs"
@@ -1084,13 +1728,24 @@ function ExplorerPanel({
               {selectedIds.size ? ` · ${selectedIds.size} selected` : ""}
             </span>
             {selectedIds.size > 0 && (
-              <button
-                className="rounded-lg border border-red-200 px-2.5 py-1.5 font-semibold text-red-700 hover:bg-red-50"
-                type="button"
-                onClick={deleteSelection}
-              >
-                Delete selected
-              </button>
+              <div className="flex flex-wrap gap-2">
+                {selectedEntry && (
+                  <button
+                    className="rounded-lg border border-border px-2.5 py-1.5 font-semibold text-ink hover:bg-canvas"
+                    type="button"
+                    onClick={renameSelection}
+                  >
+                    Rename
+                  </button>
+                )}
+                <button
+                  className="rounded-lg border border-red-200 px-2.5 py-1.5 font-semibold text-red-700 hover:bg-red-50"
+                  type="button"
+                  onClick={deleteSelection}
+                >
+                  Delete selected
+                </button>
+              </div>
             )}
           </div>
           {visibleEntries.length > 0 ? (
@@ -1244,6 +1899,13 @@ function formatBytes(size?: number) {
   return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
+function formatDuration(seconds?: number) {
+  if (seconds === undefined || !Number.isFinite(seconds)) return "—";
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.max(0, Math.round(seconds % 60));
+  return minutes > 0 ? `${minutes}m ${remainder}s` : `${remainder}s`;
+}
+
 function ObjectInspector({
   metadata,
   preview,
@@ -1252,6 +1914,7 @@ function ObjectInspector({
   onPreview,
   onShare,
   onClosePreview,
+  onMetadataSaved,
 }: {
   metadata: ObjectMetadata | null;
   preview: PreviewResult | null;
@@ -1260,10 +1923,25 @@ function ObjectInspector({
   onPreview: () => void;
   onShare: (expiresInSeconds: number) => void;
   onClosePreview: () => void;
+  onMetadataSaved: (metadata: ObjectMetadata) => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [shareExpiry, setShareExpiry] = useState("3600");
+  const [contentType, setContentType] = useState("");
+  const [contentDisposition, setContentDisposition] = useState("");
+  const [cacheControl, setCacheControl] = useState("");
+  const [userMetadataText, setUserMetadataText] = useState("{}");
+  const [metadataMessage, setMetadataMessage] = useState("");
+  const [metadataSaving, setMetadataSaving] = useState(false);
   useEffect(() => setCopied(false), [shareLink?.url]);
+  useEffect(() => {
+    if (!metadata) return;
+    setContentType(metadata.contentType ?? "");
+    setContentDisposition(metadata.contentDisposition ?? "");
+    setCacheControl(metadata.cacheControl ?? "");
+    setUserMetadataText(JSON.stringify(metadata.userMetadata, null, 2));
+    setMetadataMessage("");
+  }, [metadata]);
   if (!metadata) {
     return (
       <section className="rounded-3xl border border-border bg-panel p-5 shadow-soft">
@@ -1287,7 +1965,47 @@ function ObjectInspector({
       setCopied(false);
     }
   };
+  const saveMetadata = async () => {
+    let userMetadata: Record<string, string> | undefined;
+    try {
+      const parsed: unknown = JSON.parse(userMetadataText);
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        Object.values(parsed).some((value) => typeof value !== "string")
+      ) {
+        throw new Error("User metadata must be a JSON object of strings.");
+      }
+      userMetadata = parsed as Record<string, string>;
+    } catch (error) {
+      setMetadataMessage(
+        error instanceof Error ? error.message : "Invalid user metadata JSON.",
+      );
+      return;
+    }
+    setMetadataSaving(true);
+    try {
+      const result = await commands.editMetadata({
+        schemaVersion: 1,
+        profileId: metadata.profileId,
+        bucket: metadata.bucket,
+        key: metadata.key,
+        contentType: contentType.trim() || undefined,
+        contentDisposition: contentDisposition.trim() || undefined,
+        cacheControl: cacheControl.trim() || undefined,
+        userMetadata,
+      });
+      setMetadataMessage(result.warning);
+      onMetadataSaved(result.metadata);
+    } catch (error) {
+      setMetadataMessage(formatCommandError(error));
+    } finally {
+      setMetadataSaving(false);
+    }
+  };
   const rows: [string, string | undefined][] = [
+    ["Profile", metadata.profileId],
     ["Type", metadata.contentType],
     [
       "Size",
@@ -1301,6 +2019,12 @@ function ObjectInspector({
     ["Disposition", metadata.contentDisposition],
     ["Cache control", metadata.cacheControl],
     ["Encoding", metadata.contentEncoding],
+    ["Language", metadata.contentLanguage],
+    ["Expires", metadata.expires],
+    ["Checksum SHA-256", metadata.checksumSha256],
+    ["Checksum SHA-1", metadata.checksumSha1],
+    ["Checksum CRC32", metadata.checksumCrc32],
+    ["Checksum CRC32C", metadata.checksumCrc32c],
   ];
   return (
     <section className="rounded-3xl border border-border bg-panel p-5 shadow-soft">
@@ -1376,6 +2100,63 @@ function ObjectInspector({
           </div>
         </div>
       )}
+      <div className="mt-4 border-t border-border pt-4">
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted">
+          Editable metadata
+        </p>
+        <div className="grid gap-2 sm:grid-cols-3">
+          <label className="text-xs">
+            Content-Type
+            <input
+              className="input mt-1 w-full"
+              value={contentType}
+              onChange={(event) => setContentType(event.target.value)}
+            />
+          </label>
+          <label className="text-xs">
+            Content-Disposition
+            <input
+              className="input mt-1 w-full"
+              value={contentDisposition}
+              onChange={(event) => setContentDisposition(event.target.value)}
+            />
+          </label>
+          <label className="text-xs">
+            Cache-Control
+            <input
+              className="input mt-1 w-full"
+              value={cacheControl}
+              onChange={(event) => setCacheControl(event.target.value)}
+            />
+          </label>
+        </div>
+        <label className="mt-2 block text-xs">
+          User metadata (JSON object)
+          <textarea
+            className="input mt-1 min-h-20 w-full font-mono text-[11px]"
+            value={userMetadataText}
+            onChange={(event) => setUserMetadataText(event.target.value)}
+          />
+        </label>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            className="rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-accent-foreground disabled:opacity-50"
+            type="button"
+            disabled={metadataSaving}
+            onClick={() => void saveMetadata()}
+          >
+            {metadataSaving ? "Saving…" : "Save metadata"}
+          </button>
+          <span className="text-[11px] text-muted">
+            S3 metadata replacement is a non-atomic copy-on-self operation.
+          </span>
+        </div>
+        {metadataMessage && (
+          <p className="mt-2 text-xs text-muted" role="status">
+            {metadataMessage}
+          </p>
+        )}
+      </div>
       {preview && (
         <div className="mt-4 border-t border-border pt-4">
           <div className="mb-2 flex items-center justify-between gap-3">
@@ -1494,6 +2275,11 @@ function TransfersPanel({
   const [localPath, setLocalPath] = useState("");
   const [collisionPolicy, setCollisionPolicy] =
     useState<CollisionPolicy>("ask");
+  const [contentType, setContentType] = useState("");
+  const [contentDisposition, setContentDisposition] = useState("");
+  const [cacheControl, setCacheControl] = useState("");
+  const [userMetadataJson, setUserMetadataJson] = useState("");
+  const [preserveRoot, setPreserveRoot] = useState(true);
   const [formError, setFormError] = useState("");
 
   useEffect(() => {
@@ -1546,6 +2332,37 @@ function TransfersPanel({
       );
       if (typed) confirmation = typed;
     }
+    let metadata: StartTransferRequest["metadata"];
+    if (isUpload) {
+      metadata = {};
+      if (contentType.trim()) metadata.contentType = contentType.trim();
+      if (contentDisposition.trim()) {
+        metadata.contentDisposition = contentDisposition.trim();
+      }
+      if (cacheControl.trim()) metadata.cacheControl = cacheControl.trim();
+      if (userMetadataJson.trim()) {
+        try {
+          const parsed: unknown = JSON.parse(userMetadataJson);
+          if (
+            !parsed ||
+            typeof parsed !== "object" ||
+            Array.isArray(parsed) ||
+            Object.values(parsed).some((value) => typeof value !== "string")
+          ) {
+            throw new Error("User metadata must be a JSON object of strings.");
+          }
+          metadata.userMetadata = parsed as Record<string, string>;
+        } catch (error) {
+          setFormError(
+            error instanceof Error
+              ? error.message
+              : "User metadata must be valid JSON.",
+          );
+          return;
+        }
+      }
+      if (!Object.keys(metadata).length) metadata = undefined;
+    }
     const remote = (key: string): TransferEndpoint => ({
       kind: "remote",
       profileId,
@@ -1573,6 +2390,8 @@ function TransfersPanel({
       collisionPolicy,
       confirmation,
       recursive: isDelete && sourceKey.trim().endsWith("/"),
+      preserveRoot: operation === "uploadDirectory" && preserveRoot,
+      metadata,
     });
   };
 
@@ -1665,6 +2484,63 @@ function TransfersPanel({
             />
           </label>
         )}
+        {isUpload && (
+          <div className="md:col-span-2 lg:col-span-4">
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted">
+              Upload metadata (optional)
+            </p>
+            <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {operation === "uploadDirectory" && (
+                <label className="flex items-center gap-2 text-xs font-medium">
+                  <input
+                    type="checkbox"
+                    checked={preserveRoot}
+                    onChange={(event) => setPreserveRoot(event.target.checked)}
+                  />
+                  Preserve selected folder name
+                </label>
+              )}
+              <label className="text-xs font-medium">
+                Content-Type
+                <input
+                  className="input mt-1"
+                  value={contentType}
+                  onChange={(event) => setContentType(event.target.value)}
+                  placeholder="text/plain"
+                />
+              </label>
+              <label className="text-xs font-medium">
+                Content-Disposition
+                <input
+                  className="input mt-1"
+                  value={contentDisposition}
+                  onChange={(event) =>
+                    setContentDisposition(event.target.value)
+                  }
+                  placeholder="inline"
+                />
+              </label>
+              <label className="text-xs font-medium">
+                Cache-Control
+                <input
+                  className="input mt-1"
+                  value={cacheControl}
+                  onChange={(event) => setCacheControl(event.target.value)}
+                  placeholder="max-age=3600"
+                />
+              </label>
+              <label className="text-xs font-medium">
+                User metadata (JSON)
+                <textarea
+                  className="input mt-1 min-h-10 resize-y"
+                  value={userMetadataJson}
+                  onChange={(event) => setUserMetadataJson(event.target.value)}
+                  placeholder='{"x-owner":"team"}'
+                />
+              </label>
+            </div>
+          </div>
+        )}
         <label className="text-xs font-medium">
           Collision policy
           <select
@@ -1678,6 +2554,8 @@ function TransfersPanel({
             <option value="replace">Replace</option>
             <option value="skip">Skip</option>
             <option value="fail">Fail</option>
+            <option value="rename">Rename automatically</option>
+            <option value="rename">Rename automatically</option>
           </select>
         </label>
         <div className="flex items-end">
@@ -1744,6 +2622,7 @@ function TransferRow({
   ].includes(job.status);
   const pauseSupported = [
     "uploadDirectory",
+    "downloadFile",
     "downloadPrefix",
     "copyPrefix",
     "movePrefix",
@@ -1762,6 +2641,13 @@ function TransferRow({
           {job.totalItems === undefined
             ? ""
             : ` · ${job.completedItems}/${job.totalItems} items`}
+          {job.failedItems > 0 ? ` · ${job.failedItems} failed` : ""}
+          {job.speedBps === undefined
+            ? ""
+            : ` · ${formatBytes(job.speedBps)}/s`}
+          {job.etaSeconds === undefined
+            ? ""
+            : ` · ETA ${formatDuration(job.etaSeconds)}`}
         </p>
       </div>
       <div className="flex flex-wrap gap-2">
@@ -1819,6 +2705,31 @@ function SettingsPanel({
 }) {
   const [concurrentJobs, setConcurrentJobs] = useState("4");
   const [partConcurrency, setPartConcurrency] = useState("4");
+  const [multipartThreshold, setMultipartThreshold] = useState("8388608");
+  const [partSize, setPartSize] = useState("8388608");
+  const [retryLimit, setRetryLimit] = useState("3");
+  const [perProfileLimit, setPerProfileLimit] = useState("8");
+  const [retryBaseDelay, setRetryBaseDelay] = useState("500");
+  const [retryMaxDelay, setRetryMaxDelay] = useState("30000");
+  const [progressHz, setProgressHz] = useState("5");
+  const [historyDays, setHistoryDays] = useState("30");
+  const [historyMaxJobs, setHistoryMaxJobs] = useState("1000");
+  const [previewCacheBytes, setPreviewCacheBytes] = useState(
+    String(512 * 1024 * 1024),
+  );
+  const [previewCacheAgeHours, setPreviewCacheAgeHours] = useState("24");
+  const [logRetentionDays, setLogRetentionDays] = useState("14");
+  const [logMaxBytes, setLogMaxBytes] = useState(String(100 * 1024 * 1024));
+  const [typedObjectThreshold, setTypedObjectThreshold] = useState("100");
+  const [typedBytesThreshold, setTypedBytesThreshold] = useState(
+    String(10 * 1024 * 1024 * 1024),
+  );
+  const [updateChannel, setUpdateChannel] = useState<"stable" | "beta">(
+    "stable",
+  );
+  const [automaticUpdateCheck, setAutomaticUpdateCheck] = useState(true);
+  const [collisionPolicy, setCollisionPolicy] =
+    useState<CollisionPolicy>("ask");
   const [keepPartial, setKeepPartial] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -1830,6 +2741,32 @@ function SettingsPanel({
     setPartConcurrency(
       String(settings.perJobPartConcurrency ?? settings.partConcurrency ?? 4),
     );
+    setMultipartThreshold(
+      String(settings.multipartThresholdBytes ?? 8 * 1024 * 1024),
+    );
+    setPartSize(String(settings.initialPartSizeBytes ?? 8 * 1024 * 1024));
+    setRetryLimit(String(settings.retryLimit ?? 3));
+    setPerProfileLimit(String(settings.perProfileRequestLimit ?? 8));
+    setRetryBaseDelay(String(settings.retryBaseDelayMs ?? 500));
+    setRetryMaxDelay(String(settings.retryMaxDelayMs ?? 30000));
+    setProgressHz(String(settings.progressHz ?? 5));
+    setHistoryDays(String(settings.transferHistoryDays ?? 30));
+    setHistoryMaxJobs(String(settings.transferHistoryMaxJobs ?? 1000));
+    setPreviewCacheBytes(
+      String(settings.previewCacheBytes ?? 512 * 1024 * 1024),
+    );
+    setPreviewCacheAgeHours(String(settings.previewCacheMaxAgeHours ?? 24));
+    setLogRetentionDays(String(settings.logRetentionDays ?? 14));
+    setLogMaxBytes(String(settings.logMaxBytes ?? 100 * 1024 * 1024));
+    setTypedObjectThreshold(
+      String(settings.typedConfirmObjectThreshold ?? 100),
+    );
+    setTypedBytesThreshold(
+      String(settings.typedConfirmBytesThreshold ?? 10 * 1024 * 1024 * 1024),
+    );
+    setUpdateChannel(settings.updateChannel ?? "stable");
+    setAutomaticUpdateCheck(settings.automaticUpdateCheck ?? true);
+    setCollisionPolicy(settings.defaultCollisionPolicy ?? "ask");
     setKeepPartial(Boolean(settings.keepPartialDownloads));
   }, [settings]);
 
@@ -1839,10 +2776,40 @@ function SettingsPanel({
         schemaVersion: 1,
         concurrentJobs: Number(concurrentJobs),
         perJobPartConcurrency: Number(partConcurrency),
+        multipartThresholdBytes: Number(multipartThreshold),
+        initialPartSizeBytes: Number(partSize),
+        retryLimit: Number(retryLimit),
+        perProfileRequestLimit: Number(perProfileLimit),
+        retryBaseDelayMs: Number(retryBaseDelay),
+        retryMaxDelayMs: Number(retryMaxDelay),
+        progressHz: Number(progressHz),
+        transferHistoryDays: Number(historyDays),
+        transferHistoryMaxJobs: Number(historyMaxJobs),
+        previewCacheBytes: Number(previewCacheBytes),
+        previewCacheMaxAgeHours: Number(previewCacheAgeHours),
+        logRetentionDays: Number(logRetentionDays),
+        logMaxBytes: Number(logMaxBytes),
+        typedConfirmObjectThreshold: Number(typedObjectThreshold),
+        typedConfirmBytesThreshold: Number(typedBytesThreshold),
+        updateChannel,
+        automaticUpdateCheck,
+        defaultCollisionPolicy: collisionPolicy,
         keepPartialDownloads: keepPartial,
       });
       await onSaved();
       setMessage("Settings saved");
+    } catch (error) {
+      setMessage(formatCommandError(error));
+    }
+  };
+
+  const reset = async () => {
+    if (!window.confirm("Reset transfer settings to their safe defaults?"))
+      return;
+    try {
+      await commands.resetSettings();
+      await onSaved();
+      setMessage("Settings reset to defaults");
     } catch (error) {
       setMessage(formatCommandError(error));
     }
@@ -1860,15 +2827,24 @@ function SettingsPanel({
             Transfer limits and safe recovery defaults are persisted locally.
           </p>
         </div>
-        <button
-          className="rounded-xl border border-border px-3 py-2 text-xs font-semibold"
-          type="button"
-          onClick={() => void save()}
-        >
-          Save settings
-        </button>
+        <div className="flex gap-2">
+          <button
+            className="rounded-xl border border-border px-3 py-2 text-xs font-semibold"
+            type="button"
+            onClick={() => void reset()}
+          >
+            Reset
+          </button>
+          <button
+            className="rounded-xl border border-border px-3 py-2 text-xs font-semibold"
+            type="button"
+            onClick={() => void save()}
+          >
+            Save settings
+          </button>
+        </div>
       </div>
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <label className="text-sm">
           Concurrent jobs
           <input
@@ -1891,6 +2867,196 @@ function SettingsPanel({
             onChange={(event) => setPartConcurrency(event.target.value)}
           />
         </label>
+        <label className="text-sm">
+          Multipart threshold (bytes)
+          <input
+            className="input mt-1"
+            type="number"
+            min={5 * 1024 * 1024}
+            max={5 * 1024 * 1024 * 1024}
+            value={multipartThreshold}
+            onChange={(event) => setMultipartThreshold(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Part size (bytes)
+          <input
+            className="input mt-1"
+            type="number"
+            min={5 * 1024 * 1024}
+            max={5 * 1024 * 1024 * 1024}
+            value={partSize}
+            onChange={(event) => setPartSize(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Retry limit
+          <input
+            className="input mt-1"
+            type="number"
+            min={0}
+            max={10}
+            value={retryLimit}
+            onChange={(event) => setRetryLimit(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Collision default
+          <select
+            className="input mt-1"
+            value={collisionPolicy}
+            onChange={(event) =>
+              setCollisionPolicy(event.target.value as CollisionPolicy)
+            }
+          >
+            <option value="ask">Ask</option>
+            <option value="replace">Replace</option>
+            <option value="skip">Skip</option>
+            <option value="fail">Fail</option>
+            <option value="rename">Rename automatically</option>
+          </select>
+        </label>
+        <label className="text-sm">
+          History retention (days)
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            max={365}
+            value={historyDays}
+            onChange={(event) => setHistoryDays(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Maximum history jobs
+          <input
+            className="input mt-1"
+            type="number"
+            min={100}
+            max={100000}
+            value={historyMaxJobs}
+            onChange={(event) => setHistoryMaxJobs(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Requests per profile
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            max={32}
+            value={perProfileLimit}
+            onChange={(event) => setPerProfileLimit(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Retry base delay (ms)
+          <input
+            className="input mt-1"
+            type="number"
+            min={100}
+            max={5000}
+            value={retryBaseDelay}
+            onChange={(event) => setRetryBaseDelay(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Retry max delay (ms)
+          <input
+            className="input mt-1"
+            type="number"
+            min={1000}
+            max={120000}
+            value={retryMaxDelay}
+            onChange={(event) => setRetryMaxDelay(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Progress updates (Hz)
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            max={10}
+            value={progressHz}
+            onChange={(event) => setProgressHz(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Preview cache (bytes)
+          <input
+            className="input mt-1"
+            type="number"
+            min={64 * 1024 * 1024}
+            value={previewCacheBytes}
+            onChange={(event) => setPreviewCacheBytes(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Preview cache age (hours)
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            max={168}
+            value={previewCacheAgeHours}
+            onChange={(event) => setPreviewCacheAgeHours(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Log retention (days)
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            max={90}
+            value={logRetentionDays}
+            onChange={(event) => setLogRetentionDays(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Log maximum (bytes)
+          <input
+            className="input mt-1"
+            type="number"
+            min={10 * 1024 * 1024}
+            value={logMaxBytes}
+            onChange={(event) => setLogMaxBytes(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Typed delete object threshold
+          <input
+            className="input mt-1"
+            type="number"
+            min={1}
+            value={typedObjectThreshold}
+            onChange={(event) => setTypedObjectThreshold(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Typed delete bytes threshold
+          <input
+            className="input mt-1"
+            type="number"
+            min={1024 * 1024}
+            value={typedBytesThreshold}
+            onChange={(event) => setTypedBytesThreshold(event.target.value)}
+          />
+        </label>
+        <label className="text-sm">
+          Update channel
+          <select
+            className="input mt-1"
+            value={updateChannel}
+            onChange={(event) =>
+              setUpdateChannel(event.target.value as "stable" | "beta")
+            }
+          >
+            <option value="stable">Stable</option>
+            <option value="beta">Beta</option>
+          </select>
+        </label>
         <label className="flex items-center gap-2 self-end text-sm">
           <input
             type="checkbox"
@@ -1898,6 +3064,14 @@ function SettingsPanel({
             onChange={(event) => setKeepPartial(event.target.checked)}
           />{" "}
           Keep partial downloads
+        </label>
+        <label className="flex items-center gap-2 self-end text-sm">
+          <input
+            type="checkbox"
+            checked={automaticUpdateCheck}
+            onChange={(event) => setAutomaticUpdateCheck(event.target.checked)}
+          />
+          Automatic update checks
         </label>
       </div>
       {message && (
@@ -1983,7 +3157,7 @@ function DiagnosticsPanel({ id }: { id: string }) {
           className="input min-w-[18rem] flex-1"
           value={destination}
           onChange={(event) => setDestination(event.target.value)}
-          placeholder="C:\\Users\\You\\Desktop\\s3fm-diagnostics.json"
+          placeholder="C:\\Users\\You\\Desktop\\s3fm-diagnostics.zip"
           aria-label="Diagnostics export path"
         />
         <button
@@ -2023,19 +3197,24 @@ function ProfileEditor({
   onTest: (draft: ProfileDraft) => void;
   onSave: (draft: ProfileDraft) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState<ProfileDraft>(initial);
+  const [draft, setDraft] = useState<ProfileDraft>(() => ({
+    ...initial,
+    secretAccessKey: undefined,
+    sessionToken: undefined,
+  }));
+  const secretFields = useRef({
+    secretAccessKey: initial.secretAccessKey ?? "",
+    sessionToken: initial.sessionToken ?? "",
+  });
   const update = <K extends keyof ProfileDraft>(
     key: K,
     value: ProfileDraft[K],
   ) => setDraft((current) => ({ ...current, [key]: value }));
   const isCustomEndpoint =
     draft.provider === "customS3" || draft.provider === "minio";
-  const clearSecretFields = () =>
-    setDraft((current) => ({
-      ...current,
-      secretAccessKey: "",
-      sessionToken: "",
-    }));
+  const clearSecretFields = () => {
+    secretFields.current = { secretAccessKey: "", sessionToken: "" };
+  };
   const setProvider = (provider: ProviderType) => {
     const defaults: Record<ProviderType, Partial<ProfileDraft>> = {
       awsS3: {
@@ -2079,7 +3258,11 @@ function ProfileEditor({
         className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-3xl border border-border bg-panel p-6 shadow-2xl"
         onSubmit={(event) => {
           event.preventDefault();
-          const payload = { ...draft };
+          const payload = {
+            ...draft,
+            secretAccessKey: secretFields.current.secretAccessKey || undefined,
+            sessionToken: secretFields.current.sessionToken || undefined,
+          };
           clearSecretFields();
           void onSave(payload);
         }}
@@ -2219,10 +3402,10 @@ function ProfileEditor({
             <input
               className="input"
               type="password"
-              value={draft.secretAccessKey}
-              onChange={(event) =>
-                update("secretAccessKey", event.target.value)
-              }
+              defaultValue={initial.secretAccessKey}
+              onChange={(event) => {
+                secretFields.current.secretAccessKey = event.target.value;
+              }}
               autoComplete="new-password"
               placeholder={
                 profile ? "Leave blank to keep current" : "Secret access key"
@@ -2236,8 +3419,10 @@ function ProfileEditor({
             <input
               className="input"
               type="password"
-              value={draft.sessionToken}
-              onChange={(event) => update("sessionToken", event.target.value)}
+              defaultValue={initial.sessionToken}
+              onChange={(event) => {
+                secretFields.current.sessionToken = event.target.value;
+              }}
               autoComplete="new-password"
             />
           </Field>
@@ -2305,7 +3490,12 @@ function ProfileEditor({
             className="rounded-xl border border-border px-4 py-2.5 text-sm font-semibold hover:bg-canvas"
             type="button"
             onClick={() => {
-              const payload = { ...draft };
+              const payload = {
+                ...draft,
+                secretAccessKey:
+                  secretFields.current.secretAccessKey || undefined,
+                sessionToken: secretFields.current.sessionToken || undefined,
+              };
               clearSecretFields();
               onTest(payload);
             }}

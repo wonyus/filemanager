@@ -3,7 +3,10 @@ use tauri::{command, State};
 use crate::{
     app_state::AppState,
     domain::error::PublicError,
-    dto::profile::{ConnectionTestResult, ProfileDetail, ProfileDraft, ProfileSummary},
+    dto::profile::{
+        ConnectionTestResult, ProfileDetail, ProfileDraft, ProfileExportRequest,
+        ProfileExportResult, ProfileImportRequest, ProfileImportResult, ProfileSummary,
+    },
 };
 
 #[command]
@@ -78,4 +81,28 @@ pub async fn test_profile(
     draft: ProfileDraft,
 ) -> Result<ConnectionTestResult, PublicError> {
     state.profiles.test_profile(draft).await.map_err(Into::into)
+}
+
+#[command]
+pub async fn export_profiles(
+    state: State<'_, AppState>,
+    request: ProfileExportRequest,
+) -> Result<ProfileExportResult, PublicError> {
+    state
+        .profiles
+        .export_profiles(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[command]
+pub async fn import_profiles(
+    state: State<'_, AppState>,
+    request: ProfileImportRequest,
+) -> Result<ProfileImportResult, PublicError> {
+    state
+        .profiles
+        .import_profiles(request)
+        .await
+        .map_err(Into::into)
 }

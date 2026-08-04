@@ -4,7 +4,8 @@ use crate::{
     app_state::AppState,
     domain::error::PublicError,
     dto::metadata::{
-        ObjectMetadata, ObjectRequest, PreviewRequest, PreviewResult, ShareLink, ShareLinkRequest,
+        MetadataEditRequest, MetadataEditResult, ObjectMetadata, ObjectRequest, PreviewRequest,
+        PreviewResult, ShareLink, ShareLinkRequest,
     },
 };
 
@@ -16,6 +17,18 @@ pub async fn head_object(
     state
         .profiles
         .head_object(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[command]
+pub async fn edit_metadata(
+    state: State<'_, AppState>,
+    request: MetadataEditRequest,
+) -> Result<MetadataEditResult, PublicError> {
+    state
+        .profiles
+        .edit_metadata(request)
         .await
         .map_err(Into::into)
 }

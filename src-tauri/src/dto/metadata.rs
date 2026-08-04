@@ -27,6 +27,31 @@ pub struct ObjectRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MetadataEditRequest {
+    pub schema_version: u16,
+    pub profile_id: String,
+    pub bucket: String,
+    pub key: String,
+    /// None preserves the existing value; a supplied value replaces it.
+    pub content_type: Option<String>,
+    /// None preserves the existing value; a supplied value replaces it.
+    pub content_disposition: Option<String>,
+    /// None preserves the existing value; a supplied value replaces it.
+    pub cache_control: Option<String>,
+    /// Replaces the complete user-metadata map when supplied.
+    pub user_metadata: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataEditResult {
+    pub schema_version: u16,
+    pub metadata: ObjectMetadata,
+    pub warning: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewRequest {
     pub schema_version: u16,
     pub profile_id: String,

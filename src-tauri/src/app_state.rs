@@ -51,9 +51,10 @@ impl AppState {
         let settings = Arc::new(SettingsService::new(initial_settings.clone()));
         // The scheduler is created from the persisted setting so a restart
         // cannot silently fall back to the hard-coded default of four jobs.
-        let transfers = Arc::new(TransferManager::new(usize::from(
-            initial_settings.concurrent_jobs,
-        )));
+        let transfers = Arc::new(TransferManager::new_with_database(
+            usize::from(initial_settings.concurrent_jobs),
+            database.clone(),
+        ));
         let diagnostics = Arc::new(DiagnosticsService::new(data_dir));
         let profiles = Arc::new(ProfileService::new(
             database.clone(),

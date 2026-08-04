@@ -54,6 +54,9 @@ impl CollisionResolution {
             CollisionPolicy::Replace => Self::Replace,
             CollisionPolicy::Skip => Self::Skip,
             CollisionPolicy::Fail => Self::Fail,
+            // Recursive rename requires a destination reservation phase. The
+            // planner currently fails safely rather than risking an overwrite.
+            CollisionPolicy::Rename => Self::Ask,
         }
     }
 }
@@ -129,6 +132,31 @@ pub fn plan_upload_directory(
     existing_destination_keys: &HashSet<String>,
     preserve_empty_folders: bool,
 ) -> Result<RecursivePlan, AppError> {
+    plan_upload_directory_with_options(
+        source_root,
+        profile_id,
+        bucket,
+        destination_prefix,
+        collision_policy,
+        existing_destination_keys,
+        preserve_empty_folders,
+        false,
+    )
+}
+
+/// Variant used by the UI when the selected directory name should be retained
+/// under the destination prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_upload_directory_with_options(
+    source_root: &Path,
+    profile_id: &str,
+    bucket: &str,
+    destination_prefix: &str,
+    collision_policy: CollisionPolicy,
+    existing_destination_keys: &HashSet<String>,
+    preserve_empty_folders: bool,
+    preserve_root: bool,
+) -> Result<RecursivePlan, AppError> {
     validate_profile_bucket(profile_id, bucket)?;
     if destination_prefix.contains('\0') || destination_prefix.starts_with('/') {
         return Err(AppError::Validation(
@@ -142,12 +170,28 @@ pub fn plan_upload_directory(
         ));
     }
     let mut items = Vec::new();
+    let destination_prefix = if preserve_root {
+        let folder_name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                AppError::Validation("selected upload folder has no usable name".to_string())
+            })?;
+        format!(
+            "{}{}{}/",
+            prefix_with_slash(destination_prefix),
+            folder_name,
+            ""
+        )
+    } else {
+        destination_prefix.to_string()
+    };
     walk_local_directory(
         &root,
         &root,
         profile_id,
         bucket,
-        destination_prefix,
+        &destination_prefix,
         collision_policy,
         existing_destination_keys,
         preserve_empty_folders,

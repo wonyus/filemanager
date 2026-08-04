@@ -2,19 +2,25 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   BucketSummary,
+  Bookmark,
   ConnectionTestResult,
   DiagnosticsExportRequest,
   DiagnosticsExportResult,
   ObjectMetadata,
+  MetadataEditRequest,
+  MetadataEditResult,
   ObjectRequest,
   ListEntriesPage,
   ListEntriesRequest,
   LogDirectoryResult,
   PreviewRequest,
   PreviewResult,
+  RecentLocation,
   ProfileSummary,
   ProfileDetail,
   ProfileDraft,
+  ProfileExportResult,
+  ProfileImportResult,
   PublicError,
   ShareLink,
   ShareLinkRequest,
@@ -58,14 +64,50 @@ export const commands = {
     invoke<ProfileDetail>("duplicate_profile", { id }),
   deleteProfile: (id: string) =>
     invoke<void>("delete_profile", { id, confirmation: "DELETE" }),
+  exportProfiles: (profileIds: string[], destinationPath: string) =>
+    invoke<ProfileExportResult>("export_profiles", {
+      request: { schemaVersion: 1, profileIds, destinationPath },
+    }),
+  importProfiles: (sourcePath: string) =>
+    invoke<ProfileImportResult>("import_profiles", {
+      request: { schemaVersion: 1, sourcePath },
+    }),
   testProfile: (draft: ProfileDraft) =>
     invoke<ConnectionTestResult>("test_profile", { draft }),
   listBuckets: (profileId: string) =>
     invoke<BucketSummary[]>("list_buckets", { profileId }),
   listEntries: (request: ListEntriesRequest) =>
     invoke<ListEntriesPage>("list_entries", { request }),
+  addBookmark: (request: {
+    schemaVersion: number;
+    profileId: string;
+    bucket: string;
+    prefix: string;
+    name: string;
+    sortOrder?: number;
+  }) => invoke<Bookmark>("add_bookmark", { request }),
+  listBookmarks: (profileId: string) =>
+    invoke<Bookmark[]>("list_bookmarks", {
+      request: { schemaVersion: 1, profileId },
+    }),
+  removeBookmark: (id: number) =>
+    invoke<void>("remove_bookmark", { request: { id } }),
+  recordRecentLocation: (location: {
+    profileId: string;
+    bucket: string;
+    prefix: string;
+  }) =>
+    invoke<RecentLocation>("record_recent_location", {
+      request: { schemaVersion: 1, location },
+    }),
+  listRecentLocations: (profileId: string) =>
+    invoke<RecentLocation[]>("list_recent_locations", {
+      request: { schemaVersion: 1, profileId, limit: 30 },
+    }),
   headObject: (request: ObjectRequest) =>
     invoke<ObjectMetadata>("head_object", { request }),
+  editMetadata: (request: MetadataEditRequest) =>
+    invoke<MetadataEditResult>("edit_metadata", { request }),
   previewObject: (request: PreviewRequest) =>
     invoke<PreviewResult>("preview_object", { request }),
   createShareLink: (request: ShareLinkRequest) =>
@@ -93,6 +135,7 @@ export const commands = {
     invoke<number>("clear_transfer_history", {
       request: { schemaVersion: 1, before: null, includeFailed: true },
     }),
+  interruptActiveTransfers: () => invoke<number>("interrupt_active_transfers"),
   updateSettings: (patch: Record<string, unknown>) =>
     invoke<SettingsSnapshot>("update_settings", { patch }),
   resetSettings: () => invoke<SettingsSnapshot>("reset_settings"),

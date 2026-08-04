@@ -30,6 +30,7 @@ pub enum AppErrorCode {
     LocalPathInvalid,
     LocalPermissionDenied,
     LocalDiskFull,
+    LocalFileChanged,
     TransferCancelled,
     TransferStateConflict,
     DatabaseError,
@@ -73,6 +74,8 @@ pub enum AppError {
     LocalPermissionDenied,
     #[error("local disk is full")]
     LocalDiskFull,
+    #[error("local file changed during transfer")]
+    LocalFileChanged,
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
     #[error("database migration failed: {0}")]
@@ -204,6 +207,11 @@ impl From<AppError> for PublicError {
                 AppErrorCode::LocalDiskFull,
                 false,
                 "There is not enough local disk space.".to_string(),
+            ),
+            AppError::LocalFileChanged => (
+                AppErrorCode::LocalFileChanged,
+                false,
+                "The local file changed during upload; the object was not trusted as a stable snapshot.".to_string(),
             ),
             AppError::Unknown(_) => (
                 AppErrorCode::Unknown,

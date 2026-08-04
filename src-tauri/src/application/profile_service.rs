@@ -1,5 +1,6 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -7,7 +8,7 @@ use std::{
 use aws_sdk_s3::presigning::PresigningConfig;
 use chrono::{Duration as ChronoDuration, Utc};
 use secrecy::SecretString;
-use tokio::io::AsyncReadExt;
+use tokio::{fs, io::AsyncReadExt};
 use uuid::Uuid;
 
 use crate::{
@@ -20,13 +21,15 @@ use crate::{
             EntryKind, EntrySummary, ExplorerLocation, ListEntriesPage, ListEntriesRequest,
         },
         metadata::{
-            ObjectMetadata, ObjectRequest, PreviewKind, PreviewRequest, PreviewResult, ShareLink,
-            ShareLinkRequest, DEFAULT_PREVIEW_LIMIT_BYTES, MAX_SHARE_SECONDS,
-            METADATA_SCHEMA_VERSION,
+            MetadataEditRequest, MetadataEditResult, ObjectMetadata, ObjectRequest, PreviewKind,
+            PreviewRequest, PreviewResult, ShareLink, ShareLinkRequest,
+            DEFAULT_PREVIEW_LIMIT_BYTES, MAX_SHARE_SECONDS, METADATA_SCHEMA_VERSION,
         },
         profile::{
-            BucketSummary, ConnectionTestResult, ProfileDetail, ProfileDraft, ProfileSummary,
-            SecretInput,
+            BucketSummary, ConnectionTestResult, ProfileDetail, ProfileDraft,
+            ProfileExportDocument, ProfileExportEntry, ProfileExportRequest, ProfileExportResult,
+            ProfileImportRejection, ProfileImportRequest, ProfileImportResult, ProfileSummary,
+            SecretInput, PROFILE_EXPORT_SCHEMA_VERSION,
         },
     },
     infrastructure::{
@@ -72,6 +75,172 @@ impl ProfileService {
 
     pub async fn get_connection_profile(&self, id: &str) -> Result<ConnectionProfile, AppError> {
         self.load_profile(id).await
+    }
+
+    /// Export provider configuration without any OS-vault reference or
+    /// credential value. The file is written atomically and is bounded to a
+    /// small, explicit profile count so it cannot become an unbounded IPC
+    /// or filesystem operation.
+    pub async fn export_profiles(
+        &self,
+        request: ProfileExportRequest,
+    ) -> Result<ProfileExportResult, AppError> {
+        if request.schema_version != PROFILE_EXPORT_SCHEMA_VERSION {
+            return Err(AppError::Validation(
+                "unsupported profile export schema version".to_string(),
+            ));
+        }
+        if request.profile_ids.is_empty() || request.profile_ids.len() > 100 {
+            return Err(AppError::Validation(
+                "profile export must contain between 1 and 100 profiles".to_string(),
+            ));
+        }
+        let destination = profile_file_path(&request.destination_path)?;
+        let mut profiles = Vec::with_capacity(request.profile_ids.len());
+        for id in &request.profile_ids {
+            let profile = self.load_profile(id).await?;
+            profiles.push(ProfileExportEntry {
+                id: profile.id.to_string(),
+                name: profile.name,
+                provider: profile.provider,
+                account_id: None,
+                endpoint: profile.endpoint,
+                region: profile.region,
+                credential_mode: profile.credential_mode,
+                access_key_id: profile.access_key_id,
+                default_bucket: profile.default_bucket,
+                root_prefix: profile.root_prefix,
+                addressing_style: profile.addressing_style,
+                allow_insecure_http: profile.allow_insecure_http,
+                favorite: profile.favorite,
+            });
+        }
+        let document = ProfileExportDocument {
+            schema_version: PROFILE_EXPORT_SCHEMA_VERSION,
+            exported_at: Utc::now().to_rfc3339(),
+            profiles,
+        };
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+            AppError::Unknown(format!("profile export encoding failed: {error}"))
+        })?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temporary = destination.with_extension("tmp");
+        fs::write(&temporary, &bytes).await?;
+        fs::rename(&temporary, &destination).await?;
+        Ok(ProfileExportResult {
+            schema_version: PROFILE_EXPORT_SCHEMA_VERSION,
+            path: destination.to_string_lossy().into_owned(),
+            profile_count: document.profiles.len(),
+            redacted: true,
+        })
+    }
+
+    /// Import portable configuration into new local UUIDs. Imported
+    /// credentials are intentionally absent; the user must enter them in the
+    /// profile editor before testing or using the connection. Provider
+    /// endpoints and roots are validated by the same Rust rules as normal
+    /// profile creation, so exported capability claims cannot bypass checks.
+    pub async fn import_profiles(
+        &self,
+        request: ProfileImportRequest,
+    ) -> Result<ProfileImportResult, AppError> {
+        if request.schema_version != PROFILE_EXPORT_SCHEMA_VERSION {
+            return Err(AppError::Validation(
+                "unsupported profile import schema version".to_string(),
+            ));
+        }
+        let source = profile_file_path(&request.source_path)?;
+        let bytes = fs::read(&source).await?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(AppError::Validation(
+                "profile import file exceeds the 2 MiB safety limit".to_string(),
+            ));
+        }
+        let document: ProfileExportDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::Validation(format!("invalid profile export: {error}")))?;
+        if document.schema_version != PROFILE_EXPORT_SCHEMA_VERSION {
+            return Err(AppError::Validation(
+                "unsupported profile export schema version".to_string(),
+            ));
+        }
+        if document.profiles.is_empty() || document.profiles.len() > 100 {
+            return Err(AppError::Validation(
+                "profile import must contain between 1 and 100 profiles".to_string(),
+            ));
+        }
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let mut imported = Vec::new();
+        let mut rejected = Vec::new();
+        for entry in document.profiles {
+            let name = entry.name.clone();
+            let draft = ProfileDraft {
+                schema_version: 1,
+                id: None,
+                name: entry.name,
+                provider: entry.provider,
+                account_id: entry.account_id,
+                endpoint: entry.endpoint,
+                region: entry.region,
+                credential_mode: entry.credential_mode,
+                access_key_id: entry.access_key_id,
+                secret_access_key: SecretInput::Unchanged,
+                session_token: SecretInput::Unchanged,
+                default_bucket: entry.default_bucket,
+                root_prefix: entry.root_prefix,
+                addressing_style: Some(entry.addressing_style),
+                // Imported insecure HTTP is never enabled implicitly.
+                allow_insecure_http: false,
+                favorite: entry.favorite,
+            };
+            let now = Utc::now();
+            let candidate_id = Uuid::new_v4();
+            let placeholder_secret = SecretReference::new(candidate_id, "import-placeholder");
+            let placeholder_session =
+                SecretReference::new(candidate_id, "import-session-placeholder");
+            let candidate = match profile_from_draft(
+                &draft,
+                candidate_id,
+                now,
+                now,
+                Some(placeholder_secret),
+                (entry.credential_mode
+                    == crate::domain::provider::CredentialMode::TemporarySession)
+                    .then_some(placeholder_session),
+            ) {
+                Ok(profile) => profile,
+                Err(AppError::Validation(reason)) => {
+                    rejected.push(ProfileImportRejection { name, reason });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut candidate = candidate;
+            candidate.secret_reference = None;
+            candidate.session_reference = None;
+            if let Err(error) = candidate.validate_configuration() {
+                rejected.push(ProfileImportRejection {
+                    name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            if let Err(error) = self.database.insert_profile(&candidate).await {
+                rejected.push(ProfileImportRejection {
+                    name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            imported.push(to_detail(&candidate));
+        }
+        Ok(ProfileImportResult {
+            schema_version: PROFILE_EXPORT_SCHEMA_VERSION,
+            imported,
+            rejected,
+            credentials_required: true,
+        })
     }
 
     pub async fn create_profile(&self, draft: ProfileDraft) -> Result<ProfileDetail, AppError> {
@@ -906,6 +1075,88 @@ impl ProfileService {
         Ok(metadata_from_head(&profile, &request, &key, &head))
     }
 
+    /// Replace editable HTTP/user metadata by copying an object onto itself.
+    /// S3-compatible providers implement this as a non-atomic operation, so
+    /// callers receive an explicit warning and a fresh HeadObject snapshot.
+    pub async fn edit_metadata(
+        &self,
+        request: MetadataEditRequest,
+    ) -> Result<MetadataEditResult, AppError> {
+        if request.content_type.is_none()
+            && request.content_disposition.is_none()
+            && request.cache_control.is_none()
+            && request.user_metadata.is_none()
+        {
+            return Err(AppError::Validation(
+                "metadata edit must change at least one field".to_string(),
+            ));
+        }
+        validate_metadata_patch(&request)?;
+        let object_request = ObjectRequest {
+            schema_version: request.schema_version,
+            profile_id: request.profile_id.clone(),
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+        };
+        let (profile, client, key) = self.object_context(&object_request).await?;
+        let head = self.fetch_head(&client, &request.bucket, &key).await?;
+
+        let mut user_metadata = head.metadata().cloned().unwrap_or_default();
+        if let Some(replacement) = request.user_metadata {
+            user_metadata = replacement.into_iter().collect::<HashMap<_, _>>();
+        }
+        let mut operation = client
+            .copy_object()
+            .copy_source(encode_copy_source(&request.bucket, &key))
+            .bucket(&request.bucket)
+            .key(&key)
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .set_metadata(Some(user_metadata));
+        if let Some(value) = request
+            .content_type
+            .or_else(|| head.content_type().map(ToString::to_string))
+        {
+            operation = operation.content_type(value);
+        }
+        if let Some(value) = request
+            .content_disposition
+            .or_else(|| head.content_disposition().map(ToString::to_string))
+        {
+            operation = operation.content_disposition(value);
+        }
+        if let Some(value) = request
+            .cache_control
+            .or_else(|| head.cache_control().map(ToString::to_string))
+        {
+            operation = operation.cache_control(value);
+        }
+        if let Some(value) = head.content_encoding() {
+            operation = operation.content_encoding(value);
+        }
+        if let Some(value) = head.content_language() {
+            operation = operation.content_language(value);
+        }
+        #[allow(deprecated)]
+        let expires = head.expires().cloned();
+        if let Some(value) = expires {
+            operation = operation.expires(value);
+        }
+        if let Some(value) = head.website_redirect_location() {
+            operation = operation.website_redirect_location(value);
+        }
+        operation
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_message(&error)))?;
+
+        let updated = self.fetch_head(&client, &request.bucket, &key).await?;
+        Ok(MetadataEditResult {
+            schema_version: METADATA_SCHEMA_VERSION,
+            metadata: metadata_from_head(&profile, &object_request, &key, &updated),
+            warning: "Metadata replacement uses a non-atomic copy-on-self operation; the object may briefly be unavailable.".to_string(),
+        })
+    }
+
     /// Read a bounded UTF-8 preview for an allow-listed text object.
     pub async fn preview_object(&self, request: PreviewRequest) -> Result<PreviewResult, AppError> {
         let object_request = ObjectRequest {
@@ -1146,6 +1397,56 @@ fn validate_object_bucket(bucket: &str) -> Result<(), AppError> {
         || bucket.chars().any(char::is_control)
     {
         return Err(AppError::Validation("bucket is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_metadata_patch(request: &MetadataEditRequest) -> Result<(), AppError> {
+    for (field, value, max_len) in [
+        ("contentType", request.content_type.as_deref(), 256_usize),
+        (
+            "contentDisposition",
+            request.content_disposition.as_deref(),
+            1_024_usize,
+        ),
+        (
+            "cacheControl",
+            request.cache_control.as_deref(),
+            1_024_usize,
+        ),
+    ] {
+        if let Some(value) = value {
+            if value.trim().is_empty()
+                || value.len() > max_len
+                || value.chars().any(char::is_control)
+            {
+                return Err(AppError::Validation(format!("{field} is invalid")));
+            }
+        }
+    }
+    if let Some(metadata) = &request.user_metadata {
+        if metadata.len() > 100 {
+            return Err(AppError::Validation(
+                "userMetadata cannot contain more than 100 entries".to_string(),
+            ));
+        }
+        let total_bytes = metadata
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(value.len()))
+            .sum::<usize>();
+        if total_bytes > 8_192
+            || metadata.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 128
+                    || value.len() > 2_048
+                    || key.chars().any(char::is_control)
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err(AppError::Validation(
+                "userMetadata contains an invalid key or value".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1489,6 +1790,22 @@ fn normalize_root_prefix(value: Option<&str>) -> Result<Option<String>, AppError
     }))
 }
 
+fn profile_file_path(value: &str) -> Result<PathBuf, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "profile file path is invalid".to_string(),
+        ));
+    }
+    let path = Path::new(trimmed);
+    if path.file_name().is_none() {
+        return Err(AppError::Validation(
+            "profile file path must name a file".to_string(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn normalize_location_prefix(
     profile: &ConnectionProfile,
     requested: &str,
@@ -1658,6 +1975,27 @@ fn safe_provider_message(error: &impl std::fmt::Display) -> String {
         }
 }
 
+fn encode_copy_source(bucket: &str, key: &str) -> String {
+    format!(
+        "{}/{}",
+        percent_encode_path(bucket),
+        percent_encode_path(key)
+    )
+}
+
+fn percent_encode_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1665,6 +2003,7 @@ mod tests {
         profile::ConnectionProfile,
         provider::{AddressingStyle, CredentialMode, ProviderType},
     };
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     fn profile(root_prefix: Option<&str>) -> ConnectionProfile {
@@ -1750,6 +2089,29 @@ mod tests {
             Some(PreviewKind::Video)
         ));
         assert!(preview_kind_for_content_type("application/octet-stream").is_none());
+    }
+
+    #[test]
+    fn metadata_patch_validates_editable_fields_and_user_metadata() {
+        let request = MetadataEditRequest {
+            schema_version: METADATA_SCHEMA_VERSION,
+            profile_id: Uuid::new_v4().to_string(),
+            bucket: "bucket".to_string(),
+            key: "folder/file.txt".to_string(),
+            content_type: Some("text/plain".to_string()),
+            content_disposition: None,
+            cache_control: Some("max-age=60".to_string()),
+            user_metadata: Some(BTreeMap::from([(
+                "x-owner".to_string(),
+                "desktop".to_string(),
+            )])),
+        };
+        assert!(validate_metadata_patch(&request).is_ok());
+        let invalid = MetadataEditRequest {
+            content_type: Some("text/\nplain".to_string()),
+            ..request
+        };
+        assert!(validate_metadata_patch(&invalid).is_err());
     }
 
     #[test]

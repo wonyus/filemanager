@@ -5,6 +5,7 @@ export type CredentialMode = "static" | "temporarySession";
 export type AddressingStyle = "virtualHosted" | "path";
 
 export type TransferOperation =
+  | "createFolder"
   | "uploadFile"
   | "uploadDirectory"
   | "downloadFile"
@@ -28,11 +29,18 @@ export type TransferStatus =
   | "failed"
   | "cancelled"
   | "interrupted";
-export type CollisionPolicy = "ask" | "replace" | "skip" | "fail";
+export type CollisionPolicy = "ask" | "replace" | "skip" | "fail" | "rename";
 
 export type TransferEndpoint =
   | { kind: "remote"; profileId: string; bucket: string; key: string }
   | { kind: "local"; path: string };
+
+export interface UploadMetadata {
+  contentType?: string;
+  contentDisposition?: string;
+  cacheControl?: string;
+  userMetadata?: Record<string, string>;
+}
 
 export interface StartTransferRequest {
   schemaVersion?: number;
@@ -45,6 +53,9 @@ export interface StartTransferRequest {
   totalItems?: number;
   confirmation?: string;
   recursive?: boolean;
+  preserveRoot?: boolean;
+  replaceMetadata?: boolean;
+  metadata?: UploadMetadata;
 }
 
 export interface TransferJob {
@@ -79,6 +90,9 @@ export interface TransferSummary {
   totalBytes?: number;
   completedItems: number;
   totalItems?: number;
+  failedItems: number;
+  speedBps?: number;
+  etaSeconds?: number;
   createdAt: string;
   finishedAt?: string;
 }
@@ -114,6 +128,7 @@ export type AppErrorCode =
   | "LOCAL_PATH_INVALID"
   | "LOCAL_PERMISSION_DENIED"
   | "LOCAL_DISK_FULL"
+  | "LOCAL_FILE_CHANGED"
   | "TRANSFER_CANCELLED"
   | "TRANSFER_STATE_CONFLICT"
   | "DATABASE_ERROR"
@@ -195,6 +210,20 @@ export interface ProfileDetail {
   revision: number;
 }
 
+export interface ProfileExportResult {
+  schemaVersion: number;
+  path: string;
+  profileCount: number;
+  redacted: boolean;
+}
+
+export interface ProfileImportResult {
+  schemaVersion: number;
+  imported: ProfileDetail[];
+  rejected: { name: string; reason: string }[];
+  credentialsRequired: boolean;
+}
+
 export interface ConnectionTestResult {
   schemaVersion: number;
   success: boolean;
@@ -218,6 +247,26 @@ export interface ExplorerLocation {
   profileId: string;
   bucket: string;
   prefix: string;
+}
+
+export interface Bookmark {
+  schemaVersion: number;
+  id: number;
+  profileId: string;
+  bucket: string;
+  prefix: string;
+  name: string;
+  sortOrder: number;
+  createdAt: string;
+}
+
+export interface RecentLocation {
+  schemaVersion: number;
+  id: number;
+  profileId: string;
+  bucket: string;
+  prefix: string;
+  openedAt: string;
 }
 
 export type EntryKind = "file" | "prefix" | "folderMarker";
@@ -293,6 +342,19 @@ export interface ObjectMetadata {
   previewSupported: boolean;
   previewKind?: "text" | "image" | "audio" | "video" | "pdf";
   previewReason?: string;
+}
+
+export interface MetadataEditRequest extends ObjectRequest {
+  contentType?: string;
+  contentDisposition?: string;
+  cacheControl?: string;
+  userMetadata?: Record<string, string>;
+}
+
+export interface MetadataEditResult {
+  schemaVersion: number;
+  metadata: ObjectMetadata;
+  warning: string;
 }
 
 export interface PreviewResult {

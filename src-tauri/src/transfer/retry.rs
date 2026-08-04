@@ -83,7 +83,8 @@ pub fn classify_error(error: &AppError) -> RetryClass {
         | AppError::ObjectNotFound
         | AppError::BucketAccessDenied
         | AppError::LocalPermissionDenied
-        | AppError::LocalDiskFull => RetryClass::NonRetryable,
+        | AppError::LocalDiskFull
+        | AppError::LocalFileChanged => RetryClass::NonRetryable,
         AppError::NetworkUnavailable | AppError::RequestTimedOut => RetryClass::Retryable,
         AppError::Provider(message) => classify_provider_message(message),
         AppError::Unknown(message) => classify_provider_message(message),

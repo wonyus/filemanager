@@ -6,6 +6,8 @@ use crate::domain::provider::{AddressingStyle, CredentialMode, ProviderType};
 
 pub const PROFILE_SCHEMA_VERSION: u16 = 1;
 
+pub const PROFILE_EXPORT_SCHEMA_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CredentialState {
@@ -37,6 +39,76 @@ pub struct ProfileSummary {
     pub last_connected_at: Option<String>,
     pub credential_state: CredentialState,
     pub connection_state: ConnectionState,
+}
+
+/// A portable profile configuration.  It intentionally contains only
+/// provider configuration and never an OS-vault reference or credential
+/// value; importing one always creates a profile that requires local
+/// credential entry before it can connect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileExportEntry {
+    pub id: String,
+    pub name: String,
+    pub provider: ProviderType,
+    pub account_id: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: String,
+    pub credential_mode: CredentialMode,
+    pub access_key_id: Option<String>,
+    pub default_bucket: Option<String>,
+    pub root_prefix: Option<String>,
+    pub addressing_style: AddressingStyle,
+    pub allow_insecure_http: bool,
+    pub favorite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileExportDocument {
+    pub schema_version: u16,
+    pub exported_at: String,
+    pub profiles: Vec<ProfileExportEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileExportRequest {
+    pub schema_version: u16,
+    pub profile_ids: Vec<String>,
+    pub destination_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileExportResult {
+    pub schema_version: u16,
+    pub path: String,
+    pub profile_count: usize,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileImportRequest {
+    pub schema_version: u16,
+    pub source_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileImportRejection {
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileImportResult {
+    pub schema_version: u16,
+    pub imported: Vec<ProfileDetail>,
+    pub rejected: Vec<ProfileImportRejection>,
+    pub credentials_required: bool,
 }
 
 /// Secret input deliberately has no `Serialize` implementation.  A missing

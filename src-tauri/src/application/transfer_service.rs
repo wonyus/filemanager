@@ -2,12 +2,13 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
 use aws_sdk_s3::{
     primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
+    types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
 use tokio::{
     fs::{self, File},
@@ -17,6 +18,8 @@ use tokio::{
 use uuid::Uuid;
 
 const MAX_IN_MEMORY_PART_BYTES: u64 = 64 * 1024 * 1024;
+const SINGLE_COPY_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MULTIPART_COPY_PART_BYTES: u64 = 64 * 1024 * 1024;
 
 use crate::{
     application::profile_service::ProfileService,
@@ -25,7 +28,7 @@ use crate::{
         settings::SettingsSnapshot,
         transfer::{
             CollisionPolicy, StartTransferRequest, TransferEndpoint, TransferJob,
-            TransferOperation, TransferStatus,
+            TransferOperation, TransferStatus, UploadMetadata,
         },
     },
     infrastructure::{
@@ -34,10 +37,11 @@ use crate::{
     },
     transfer::{
         recursive::{
-            execute_recursive, plan_download_prefix, plan_remote_prefix, plan_upload_directory,
-            write_mapping_manifest, CancellationFlag, RecursiveExecutor, RecursiveItem,
-            RecursivePlan, RemoteObject,
+            execute_recursive, plan_download_prefix, plan_remote_prefix,
+            plan_upload_directory_with_options, write_mapping_manifest, CancellationFlag,
+            RecursiveExecutor, RecursiveItem, RecursivePlan, RemoteObject,
         },
+        retry::{classify_error, RetryPolicy},
         settings::SettingsService,
         TransferManager,
     },
@@ -50,6 +54,14 @@ struct ExecutionOutcome {
     failed_items: u64,
     cleanup_required_items: u64,
     status: TransferStatus,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct DownloadResumeMetadata {
+    bucket: String,
+    key: String,
+    total_bytes: u64,
+    etag: Option<String>,
 }
 
 impl ExecutionOutcome {
@@ -94,6 +106,17 @@ impl TransferService {
 
     pub async fn start(&self, mut request: StartTransferRequest) -> Result<TransferJob, AppError> {
         authorize_request(&request)?;
+        if request.operation == TransferOperation::UploadFile {
+            if let TransferEndpoint::Local { path } = &request.source {
+                let source_metadata = fs::metadata(path).await?;
+                if !source_metadata.is_file() {
+                    return Err(AppError::Validation(
+                        "upload source must be a regular file".to_string(),
+                    ));
+                }
+                request.total_bytes = Some(source_metadata.len());
+            }
+        }
         request.settings_snapshot = Some(self.settings.get().await);
         let job = self.manager.create(request.clone()).await?;
         let worker = self.clone();
@@ -124,7 +147,7 @@ impl TransferService {
                 ));
             }
             let settings = request.settings_snapshot.clone().unwrap_or_default();
-            let outcome = self.execute(id, &request, &settings).await?;
+            let outcome = self.execute_with_retry(id, &request, &settings).await?;
             if self.manager.is_cancel_requested(id).await {
                 return Err(AppError::TransferStateConflict(
                     "transfer cancelled".to_string(),
@@ -179,6 +202,43 @@ impl TransferService {
         }
     }
 
+    async fn execute_with_retry(
+        &self,
+        id: Uuid,
+        request: &StartTransferRequest,
+        settings: &SettingsSnapshot,
+    ) -> Result<ExecutionOutcome, AppError> {
+        let policy = RetryPolicy {
+            retry_limit: u32::from(settings.retry_limit),
+            base_delay: std::time::Duration::from_millis(settings.retry_base_delay_ms),
+            max_delay: std::time::Duration::from_millis(settings.retry_max_delay_ms),
+        };
+        let mut retry_number = 0_u32;
+        loop {
+            match self.execute(id, request, settings).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    if self.manager.is_cancel_requested(id).await {
+                        return Err(error);
+                    }
+                    if !policy.should_retry(retry_number, classify_error(&error)) {
+                        return Err(error);
+                    }
+                    retry_number = retry_number.saturating_add(1);
+                    let _ = self.manager.transition(id, TransferStatus::Retrying).await;
+                    let delay = policy.delay_for_retry(retry_number - 1);
+                    tokio::time::sleep(delay).await;
+                    if self.manager.is_cancel_requested(id).await {
+                        return Err(AppError::TransferStateConflict(
+                            "transfer cancelled".to_string(),
+                        ));
+                    }
+                    let _ = self.manager.transition(id, TransferStatus::Running).await;
+                }
+            }
+        }
+    }
+
     async fn execute(
         &self,
         id: Uuid,
@@ -186,6 +246,7 @@ impl TransferService {
         settings: &SettingsSnapshot,
     ) -> Result<ExecutionOutcome, AppError> {
         match request.operation {
+            TransferOperation::CreateFolder => self.create_folder(id, request).await,
             TransferOperation::UploadFile => self.upload_file(id, request, settings).await,
             TransferOperation::DownloadFile => self.download_file(id, request, settings).await,
             TransferOperation::CopyObject => self.copy_object(id, request).await,
@@ -208,7 +269,7 @@ impl TransferService {
     ) -> Result<ExecutionOutcome, AppError> {
         self.manager.checkpoint(id).await?;
         let source = local_path(&request.source)?;
-        let (profile, bucket, key) = self.remote_target(request.destination.as_ref()).await?;
+        let (profile, bucket, mut key) = self.remote_target(request.destination.as_ref()).await?;
         let metadata = fs::metadata(&source).await?;
         if !metadata.is_file() {
             return Err(AppError::Validation(
@@ -216,10 +277,20 @@ impl TransferService {
             ));
         }
         let size = metadata.len();
+        if request.total_bytes.is_some_and(|planned| planned != size) {
+            return Err(AppError::LocalFileChanged);
+        }
         let credentials = resolve_profile_credentials(self.credentials.as_ref(), &profile).await?;
         let client = self.clients.get_or_create(&profile, &credentials).await?;
-        if let Err(error) = ensure_collision(&client, &bucket, &key, request.collision_policy).await
-        {
+        if request.collision_policy == CollisionPolicy::Rename {
+            key = unique_remote_key(&client, &bucket, &key).await?;
+        }
+        let collision_policy = if request.collision_policy == CollisionPolicy::Rename {
+            CollisionPolicy::Fail
+        } else {
+            request.collision_policy
+        };
+        if let Err(error) = ensure_collision(&client, &bucket, &key, collision_policy).await {
             if request.collision_policy == CollisionPolicy::Skip
                 && matches!(error, AppError::TransferStateConflict(_))
             {
@@ -228,17 +299,41 @@ impl TransferService {
             return Err(error);
         }
         if size >= settings.multipart_threshold_bytes {
-            self.upload_multipart(id, &client, &bucket, &key, &source, size, settings)
-                .await?;
+            self.upload_multipart(
+                id,
+                &client,
+                &bucket,
+                &key,
+                &source,
+                size,
+                settings,
+                request.metadata.as_ref(),
+            )
+            .await?;
         } else {
             let body = ByteStream::from_path(&source)
                 .await
                 .map_err(|error| AppError::Provider(format!("local upload stream: {error}")))?;
-            client
+            let mut upload = client
                 .put_object()
                 .bucket(&bucket)
                 .key(&key)
-                .content_length(size as i64)
+                .content_length(size as i64);
+            if let Some(metadata) = request.metadata.as_ref() {
+                if let Some(value) = metadata.content_type.as_deref() {
+                    upload = upload.content_type(value);
+                }
+                if let Some(value) = metadata.content_disposition.as_deref() {
+                    upload = upload.content_disposition(value);
+                }
+                if let Some(value) = metadata.cache_control.as_deref() {
+                    upload = upload.cache_control(value);
+                }
+                for (name, value) in &metadata.user_metadata {
+                    upload = upload.metadata(name, value);
+                }
+            }
+            upload
                 .body(body)
                 .send()
                 .await
@@ -247,7 +342,52 @@ impl TransferService {
                 .update_progress(id, size, 1, None, None)
                 .await?;
         }
+        verify_local_upload_snapshot(&source, size, metadata.modified().ok()).await?;
         Ok(ExecutionOutcome::completed(size, 1))
+    }
+
+    async fn create_folder(
+        &self,
+        id: Uuid,
+        request: &StartTransferRequest,
+    ) -> Result<ExecutionOutcome, AppError> {
+        self.manager.checkpoint(id).await?;
+        let (profile, bucket, key) = self.remote_target(Some(&request.source)).await?;
+        let marker = if key.ends_with('/') {
+            key
+        } else {
+            format!("{key}/")
+        };
+        if marker.is_empty() {
+            return Err(AppError::Validation(
+                "folder name must be non-empty".to_string(),
+            ));
+        }
+        if profile.root_prefix.as_deref() == Some(marker.as_str()) {
+            return Err(AppError::Validation(
+                "cannot recreate the profile root prefix as a folder".to_string(),
+            ));
+        }
+        let credentials = resolve_profile_credentials(self.credentials.as_ref(), &profile).await?;
+        let client = self.clients.get_or_create(&profile, &credentials).await?;
+        let base_object = marker.trim_end_matches('/');
+        if prefix_has_objects(&client, &bucket, &marker).await?
+            || object_exists(&client, &bucket, base_object).await?
+        {
+            return Err(AppError::Validation(
+                "folder or object already exists at the requested path".to_string(),
+            ));
+        }
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&marker)
+            .content_length(0)
+            .body(ByteStream::from(Vec::<u8>::new()))
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        Ok(ExecutionOutcome::completed(0, 1))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -260,6 +400,7 @@ impl TransferService {
         source: &Path,
         size: u64,
         settings: &SettingsSnapshot,
+        metadata: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
         let part_size = settings
             .initial_part_size_bytes
@@ -271,10 +412,22 @@ impl TransferService {
                 "object requires too many multipart parts".to_string(),
             ));
         }
-        let upload = client
-            .create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
+        let mut upload_builder = client.create_multipart_upload().bucket(bucket).key(key);
+        if let Some(metadata) = metadata {
+            if let Some(value) = metadata.content_type.as_deref() {
+                upload_builder = upload_builder.content_type(value);
+            }
+            if let Some(value) = metadata.content_disposition.as_deref() {
+                upload_builder = upload_builder.content_disposition(value);
+            }
+            if let Some(value) = metadata.cache_control.as_deref() {
+                upload_builder = upload_builder.cache_control(value);
+            }
+            for (name, value) in &metadata.user_metadata {
+                upload_builder = upload_builder.metadata(name, value);
+            }
+        }
+        let upload = upload_builder
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
@@ -366,42 +519,103 @@ impl TransferService {
     ) -> Result<ExecutionOutcome, AppError> {
         self.manager.checkpoint(id).await?;
         let (profile, bucket, key) = self.remote_target(Some(&request.source)).await?;
-        let destination = local_path(request.destination.as_ref().ok_or_else(|| {
+        let mut destination = local_path(request.destination.as_ref().ok_or_else(|| {
             AppError::Validation("download destination is required".to_string())
         })?)?;
         if destination.exists() && request.collision_policy != CollisionPolicy::Replace {
             if request.collision_policy == CollisionPolicy::Skip {
                 return Ok(ExecutionOutcome::completed(0, 1));
             }
-            return Err(AppError::Validation(
-                "destination already exists".to_string(),
-            ));
+            if request.collision_policy == CollisionPolicy::Rename {
+                destination = unique_local_destination(&destination)?;
+            } else {
+                return Err(AppError::Validation(
+                    "destination already exists".to_string(),
+                ));
+            }
         }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
         }
         let credentials = resolve_profile_credentials(self.credentials.as_ref(), &profile).await?;
         let client = self.clients.get_or_create(&profile, &credentials).await?;
-        let output = client
-            .get_object()
+        let partial = partial_path(&destination, id);
+        let partial_metadata = partial.with_extension("s3fm-meta");
+        let head = client
+            .head_object()
             .bucket(&bucket)
             .key(&key)
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-        let total = output.content_length().unwrap_or(0).max(0) as u64;
-        let partial = partial_path(&destination, id);
+        let total = head.content_length().unwrap_or(0).max(0) as u64;
+        let remote_etag = head.e_tag().map(ToString::to_string);
+        let mut offset = 0_u64;
+        if partial.exists() {
+            let valid_resume = if let Ok(value) = fs::read_to_string(&partial_metadata).await {
+                serde_json::from_str::<DownloadResumeMetadata>(&value)
+                    .ok()
+                    .is_some_and(|metadata| {
+                        metadata.bucket == bucket
+                            && metadata.key == key
+                            && metadata.total_bytes == total
+                            && metadata.etag == remote_etag
+                    })
+            } else {
+                false
+            };
+            if valid_resume {
+                offset = fs::metadata(&partial).await?.len();
+                if offset >= total {
+                    offset = 0;
+                    let _ = fs::remove_file(&partial).await;
+                }
+            } else {
+                let _ = fs::remove_file(&partial).await;
+                let _ = fs::remove_file(&partial_metadata).await;
+            }
+        }
+        let resume_metadata = DownloadResumeMetadata {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            total_bytes: total,
+            etag: remote_etag,
+        };
+        fs::write(
+            &partial_metadata,
+            serde_json::to_vec(&resume_metadata).map_err(|error| {
+                AppError::Unknown(format!("resume metadata encoding failed: {error}"))
+            })?,
+        )
+        .await?;
+        let mut get_request = client.get_object().bucket(&bucket).key(&key);
+        if offset > 0 {
+            get_request = get_request.range(format!("bytes={offset}-"));
+        }
+        let output = get_request
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        let response_size = output.content_length().unwrap_or(0).max(0) as u64;
+        if offset.saturating_add(response_size) != total {
+            let _ = fs::remove_file(&partial).await;
+            let _ = fs::remove_file(&partial_metadata).await;
+            return Err(AppError::Provider(
+                "download resume identity or content range did not match the remote object"
+                    .to_string(),
+            ));
+        }
         let result: Result<u64, AppError> = async {
-            let mut file = File::create(&partial).await?;
+            let mut file = if offset > 0 {
+                fs::OpenOptions::new().append(true).open(&partial).await?
+            } else {
+                File::create(&partial).await?
+            };
             let mut stream = output.body.into_async_read();
             let mut buffer = vec![0_u8; 1024 * 1024];
-            let mut transferred = 0_u64;
+            let mut transferred = offset;
             loop {
-                if self.manager.is_cancel_requested(id).await {
-                    return Err(AppError::TransferStateConflict(
-                        "transfer cancelled".to_string(),
-                    ));
-                }
+                self.manager.checkpoint(id).await?;
                 let count = stream.read(&mut buffer).await?;
                 if count == 0 {
                     break;
@@ -437,6 +651,7 @@ impl TransferService {
                     }
                     return Err(error.into());
                 }
+                let _ = fs::remove_file(&partial_metadata).await;
                 Ok(ExecutionOutcome::completed(
                     if total == 0 { transferred } else { total },
                     1,
@@ -445,6 +660,7 @@ impl TransferService {
             Err(error) => {
                 if !settings.keep_partial_downloads {
                     let _ = fs::remove_file(&partial).await;
+                    let _ = fs::remove_file(&partial_metadata).await;
                 }
                 Err(error)
             }
@@ -514,14 +730,48 @@ impl TransferService {
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
         let source_size = source_head.content_length().unwrap_or(0).max(0) as u64;
         let source_etag = source_head.e_tag().map(ToString::to_string);
-        client
-            .copy_object()
-            .copy_source(encode_copy_source(&source_bucket, &source_key))
-            .bucket(&destination.0)
-            .key(&destination.1)
-            .send()
-            .await
-            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        let multipart_copy = source_size > SINGLE_COPY_LIMIT_BYTES;
+        if multipart_copy {
+            self.copy_multipart(
+                id,
+                &client,
+                &source_bucket,
+                &source_key,
+                &destination.0,
+                &destination.1,
+                source_size,
+                &source_head,
+                request.replace_metadata,
+                request.metadata.as_ref(),
+            )
+            .await?;
+        } else {
+            let mut copy = client
+                .copy_object()
+                .copy_source(encode_copy_source(&source_bucket, &source_key))
+                .bucket(&destination.0)
+                .key(&destination.1);
+            if request.replace_metadata {
+                copy = copy.metadata_directive(MetadataDirective::Replace);
+                if let Some(metadata) = request.metadata.as_ref() {
+                    if let Some(value) = metadata.content_type.as_deref() {
+                        copy = copy.content_type(value);
+                    }
+                    if let Some(value) = metadata.content_disposition.as_deref() {
+                        copy = copy.content_disposition(value);
+                    }
+                    if let Some(value) = metadata.cache_control.as_deref() {
+                        copy = copy.cache_control(value);
+                    }
+                    for (name, value) in &metadata.user_metadata {
+                        copy = copy.metadata(name, value);
+                    }
+                }
+            }
+            copy.send()
+                .await
+                .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        }
         if self.manager.is_cancel_requested(id).await {
             return Err(AppError::TransferStateConflict(
                 "transfer cancelled".to_string(),
@@ -536,12 +786,158 @@ impl TransferService {
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
         let verified = verified_head.content_length().unwrap_or(0).max(0) as u64;
         if source_size != verified
-            || source_etag.is_some()
-                && verified_head.e_tag().map(ToString::to_string) != source_etag
+            || (!multipart_copy
+                && source_etag.is_some()
+                && verified_head.e_tag().map(ToString::to_string) != source_etag)
+            || !checksums_match(&source_head, &verified_head)
+            || if request.replace_metadata {
+                !replacement_metadata_matches(&verified_head, request.metadata.as_ref())
+            } else {
+                !metadata_matches(&source_head, &verified_head)
+            }
         {
             return Err(AppError::Provider("copy verification failed".to_string()));
         }
         Ok(ExecutionOutcome::completed(source_size, 1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_multipart(
+        &self,
+        id: Uuid,
+        client: &aws_sdk_s3::Client,
+        source_bucket: &str,
+        source_key: &str,
+        destination_bucket: &str,
+        destination_key: &str,
+        source_size: u64,
+        source_head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+        replace_metadata: bool,
+        replacement: Option<&UploadMetadata>,
+    ) -> Result<(), AppError> {
+        let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
+        if part_count > 10_000 {
+            return Err(AppError::Validation(
+                "object requires too many multipart copy parts".to_string(),
+            ));
+        }
+        let mut create = client
+            .create_multipart_upload()
+            .bucket(destination_bucket)
+            .key(destination_key);
+        if !replace_metadata {
+            if let Some(value) = source_head.content_type() {
+                create = create.content_type(value);
+            }
+            if let Some(value) = source_head.content_disposition() {
+                create = create.content_disposition(value);
+            }
+            if let Some(value) = source_head.cache_control() {
+                create = create.cache_control(value);
+            }
+            if let Some(value) = source_head.content_encoding() {
+                create = create.content_encoding(value);
+            }
+            if let Some(value) = source_head.content_language() {
+                create = create.content_language(value);
+            }
+            #[allow(deprecated)]
+            if let Some(value) = source_head.expires().cloned() {
+                create = create.expires(value);
+            }
+            if let Some(value) = source_head.website_redirect_location() {
+                create = create.website_redirect_location(value);
+            }
+            if let Some(metadata) = source_head.metadata() {
+                for (key, value) in metadata {
+                    create = create.metadata(key, value);
+                }
+            }
+        } else if let Some(metadata) = replacement {
+            if let Some(value) = metadata.content_type.as_deref() {
+                create = create.content_type(value);
+            }
+            if let Some(value) = metadata.content_disposition.as_deref() {
+                create = create.content_disposition(value);
+            }
+            if let Some(value) = metadata.cache_control.as_deref() {
+                create = create.cache_control(value);
+            }
+            for (key, value) in &metadata.user_metadata {
+                create = create.metadata(key, value);
+            }
+        }
+        let upload = create
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        let upload_id = upload
+            .upload_id()
+            .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
+            .to_string();
+        let source = encode_copy_source(source_bucket, source_key);
+        let result = async {
+            let mut parts = Vec::with_capacity(part_count as usize);
+            let mut start = 0_u64;
+            let mut part_number = 1_i32;
+            while start < source_size {
+                self.manager.checkpoint(id).await?;
+                let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
+                let output = client
+                    .upload_part_copy()
+                    .bucket(destination_bucket)
+                    .key(destination_key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(&source)
+                    .copy_source_range(format!("bytes={start}-{end}"))
+                    .send()
+                    .await
+                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                let etag = output
+                    .copy_part_result()
+                    .and_then(|result| result.e_tag())
+                    .ok_or_else(|| {
+                        AppError::Provider("provider did not return a copy part ETag".to_string())
+                    })?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(etag)
+                        .build(),
+                );
+                self.manager
+                    .update_progress(id, end + 1, 0, None, None)
+                    .await?;
+                start = end + 1;
+                part_number += 1;
+            }
+            client
+                .complete_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+            Ok::<(), AppError>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
+        result
     }
 
     async fn move_object(
@@ -579,7 +975,7 @@ impl TransferService {
                 "transfer cancelled".to_string(),
             ));
         }
-        if let Err(_error) = client
+        if let Err(error) = client
             .delete_object()
             .bucket(bucket)
             .key(key)
@@ -591,6 +987,7 @@ impl TransferService {
             warning.status = TransferStatus::CompletedWithWarnings;
             warning.failed_items = 1;
             warning.cleanup_required_items = 1;
+            let _ = self.manager.set_error(id, error).await;
             return Ok(warning);
         }
         Ok(result)
@@ -667,6 +1064,14 @@ impl TransferService {
                 )));
             }
         }
+        let total_bytes = objects
+            .iter()
+            .map(|object| object.size_bytes)
+            .collect::<Option<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().fold(0_u64, u64::saturating_add));
+        self.manager
+            .set_totals(id, Some(objects.len() as u64), total_bytes)
+            .await?;
 
         let mut completed_items = 0_u64;
         let mut failed_items = 0_u64;
@@ -781,7 +1186,7 @@ impl TransferService {
             .into_iter()
             .map(|object| object.key)
             .collect::<HashSet<_>>();
-        let plan = plan_upload_directory(
+        let plan = plan_upload_directory_with_options(
             &source_root,
             &profile.id.to_string(),
             &bucket,
@@ -789,6 +1194,7 @@ impl TransferService {
             request.collision_policy,
             &existing,
             settings.preserve_empty_folders,
+            request.preserve_root,
         )?;
         let executor = S3RecursiveExecutor {
             client,
@@ -796,6 +1202,8 @@ impl TransferService {
             transfer_id: id,
             operation: TransferOperation::UploadDirectory,
             settings: settings.clone(),
+            metadata: request.metadata.clone(),
+            replace_metadata: false,
         };
         self.execute_recursive_plan(id, plan, executor).await
     }
@@ -838,6 +1246,8 @@ impl TransferService {
             transfer_id: id,
             operation: TransferOperation::DownloadPrefix,
             settings: settings.clone(),
+            metadata: None,
+            replace_metadata: false,
         };
         self.execute_recursive_plan(id, plan, executor).await
     }
@@ -917,6 +1327,8 @@ impl TransferService {
             transfer_id: id,
             operation,
             settings: settings.clone(),
+            metadata: request.metadata.clone(),
+            replace_metadata: request.replace_metadata,
         };
         self.execute_recursive_plan(id, plan, executor).await
     }
@@ -1035,6 +1447,8 @@ struct S3RecursiveExecutor {
     transfer_id: Uuid,
     operation: TransferOperation,
     settings: SettingsSnapshot,
+    metadata: Option<UploadMetadata>,
+    replace_metadata: bool,
 }
 
 #[async_trait]
@@ -1119,22 +1533,42 @@ impl S3RecursiveExecutor {
             ));
         }
         let size = metadata.len();
+        let modified = metadata.modified().ok();
         if size >= self.settings.multipart_threshold_bytes {
-            self.upload_multipart_item(path, bucket, key, size).await?;
+            self.upload_multipart_item(path, bucket, key, size, self.metadata.as_ref())
+                .await?;
+            verify_local_upload_snapshot(Path::new(path), size, modified).await?;
             return Ok(size);
         }
         let body = ByteStream::from_path(path)
             .await
             .map_err(|error| AppError::Provider(format!("local upload stream: {error}")))?;
-        self.client
+        let mut upload = self
+            .client
             .put_object()
             .bucket(bucket)
             .key(key)
-            .content_length(size as i64)
+            .content_length(size as i64);
+        if let Some(metadata) = self.metadata.as_ref() {
+            if let Some(value) = metadata.content_type.as_deref() {
+                upload = upload.content_type(value);
+            }
+            if let Some(value) = metadata.content_disposition.as_deref() {
+                upload = upload.content_disposition(value);
+            }
+            if let Some(value) = metadata.cache_control.as_deref() {
+                upload = upload.cache_control(value);
+            }
+            for (name, value) in &metadata.user_metadata {
+                upload = upload.metadata(name, value);
+            }
+        }
+        upload
             .body(body)
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        verify_local_upload_snapshot(Path::new(path), size, modified).await?;
         Ok(size)
     }
 
@@ -1144,6 +1578,7 @@ impl S3RecursiveExecutor {
         bucket: &str,
         key: &str,
         size: u64,
+        metadata: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
         let part_size = self
             .settings
@@ -1155,11 +1590,26 @@ impl S3RecursiveExecutor {
                 "object requires too many multipart parts".to_string(),
             ));
         }
-        let upload = self
+        let mut upload_builder = self
             .client
             .create_multipart_upload()
             .bucket(bucket)
-            .key(key)
+            .key(key);
+        if let Some(metadata) = metadata {
+            if let Some(value) = metadata.content_type.as_deref() {
+                upload_builder = upload_builder.content_type(value);
+            }
+            if let Some(value) = metadata.content_disposition.as_deref() {
+                upload_builder = upload_builder.content_disposition(value);
+            }
+            if let Some(value) = metadata.cache_control.as_deref() {
+                upload_builder = upload_builder.cache_control(value);
+            }
+            for (name, value) in &metadata.user_metadata {
+                upload_builder = upload_builder.metadata(name, value);
+            }
+        }
+        let upload = upload_builder
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
@@ -1341,14 +1791,47 @@ impl S3RecursiveExecutor {
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
         let source_size = source.content_length().unwrap_or(0).max(0) as u64;
         let source_etag = source.e_tag().map(ToString::to_string);
-        self.client
-            .copy_object()
-            .copy_source(encode_copy_source(source_bucket, source_key))
-            .bucket(destination_bucket)
-            .key(destination_key)
-            .send()
-            .await
-            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        let multipart_copy = source_size > SINGLE_COPY_LIMIT_BYTES;
+        if multipart_copy {
+            self.copy_multipart_item(
+                source_bucket,
+                source_key,
+                destination_bucket,
+                destination_key,
+                source_size,
+                &source,
+                self.replace_metadata,
+                self.metadata.as_ref(),
+            )
+            .await?;
+        } else {
+            let mut copy = self
+                .client
+                .copy_object()
+                .copy_source(encode_copy_source(source_bucket, source_key))
+                .bucket(destination_bucket)
+                .key(destination_key);
+            if self.replace_metadata {
+                copy = copy.metadata_directive(MetadataDirective::Replace);
+                if let Some(metadata) = self.metadata.as_ref() {
+                    if let Some(value) = metadata.content_type.as_deref() {
+                        copy = copy.content_type(value);
+                    }
+                    if let Some(value) = metadata.content_disposition.as_deref() {
+                        copy = copy.content_disposition(value);
+                    }
+                    if let Some(value) = metadata.cache_control.as_deref() {
+                        copy = copy.cache_control(value);
+                    }
+                    for (name, value) in &metadata.user_metadata {
+                        copy = copy.metadata(name, value);
+                    }
+                }
+            }
+            copy.send()
+                .await
+                .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        }
         self.manager.checkpoint(self.transfer_id).await?;
         let destination = self
             .client
@@ -1360,11 +1843,155 @@ impl S3RecursiveExecutor {
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
         let destination_size = destination.content_length().unwrap_or(0).max(0) as u64;
         if source_size != destination_size
-            || source_etag.is_some() && destination.e_tag().map(str::to_string) != source_etag
+            || (!multipart_copy
+                && source_etag.is_some()
+                && destination.e_tag().map(str::to_string) != source_etag)
+            || if self.replace_metadata {
+                !replacement_metadata_matches(&destination, self.metadata.as_ref())
+            } else {
+                !metadata_matches(&source, &destination)
+            }
         {
             return Err(AppError::Provider("copy verification failed".to_string()));
         }
         Ok(source_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_multipart_item(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        destination_bucket: &str,
+        destination_key: &str,
+        source_size: u64,
+        source_head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+        replace_metadata: bool,
+        replacement: Option<&UploadMetadata>,
+    ) -> Result<(), AppError> {
+        let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
+        if part_count > 10_000 {
+            return Err(AppError::Validation(
+                "object requires too many multipart copy parts".to_string(),
+            ));
+        }
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(destination_bucket)
+            .key(destination_key);
+        if !replace_metadata {
+            if let Some(value) = source_head.content_type() {
+                create = create.content_type(value);
+            }
+            if let Some(value) = source_head.content_disposition() {
+                create = create.content_disposition(value);
+            }
+            if let Some(value) = source_head.cache_control() {
+                create = create.cache_control(value);
+            }
+            if let Some(value) = source_head.content_encoding() {
+                create = create.content_encoding(value);
+            }
+            if let Some(value) = source_head.content_language() {
+                create = create.content_language(value);
+            }
+            #[allow(deprecated)]
+            if let Some(value) = source_head.expires().cloned() {
+                create = create.expires(value);
+            }
+            if let Some(value) = source_head.website_redirect_location() {
+                create = create.website_redirect_location(value);
+            }
+            if let Some(metadata) = source_head.metadata() {
+                for (key, value) in metadata {
+                    create = create.metadata(key, value);
+                }
+            }
+        } else if let Some(metadata) = replacement {
+            if let Some(value) = metadata.content_type.as_deref() {
+                create = create.content_type(value);
+            }
+            if let Some(value) = metadata.content_disposition.as_deref() {
+                create = create.content_disposition(value);
+            }
+            if let Some(value) = metadata.cache_control.as_deref() {
+                create = create.cache_control(value);
+            }
+            for (key, value) in &metadata.user_metadata {
+                create = create.metadata(key, value);
+            }
+        }
+        let upload = create
+            .send()
+            .await
+            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+        let upload_id = upload
+            .upload_id()
+            .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
+            .to_string();
+        let source = encode_copy_source(source_bucket, source_key);
+        let result = async {
+            let mut parts = Vec::with_capacity(part_count as usize);
+            let mut start = 0_u64;
+            let mut part_number = 1_i32;
+            while start < source_size {
+                self.manager.checkpoint(self.transfer_id).await?;
+                let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
+                let output = self
+                    .client
+                    .upload_part_copy()
+                    .bucket(destination_bucket)
+                    .key(destination_key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(&source)
+                    .copy_source_range(format!("bytes={start}-{end}"))
+                    .send()
+                    .await
+                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                let etag = output
+                    .copy_part_result()
+                    .and_then(|result| result.e_tag())
+                    .ok_or_else(|| {
+                        AppError::Provider("provider did not return a copy part ETag".to_string())
+                    })?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(etag)
+                        .build(),
+                );
+                start = end + 1;
+                part_number += 1;
+            }
+            self.client
+                .complete_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+            Ok::<(), AppError>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
+        result
     }
 }
 
@@ -1454,12 +2081,51 @@ fn local_path(endpoint: &TransferEndpoint) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(path))
 }
 
+async fn verify_local_upload_snapshot(
+    path: &Path,
+    expected_size: u64,
+    expected_modified: Option<SystemTime>,
+) -> Result<(), AppError> {
+    let metadata = fs::symlink_metadata(path).await?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != expected_size
+        || expected_modified.is_some_and(|expected| metadata.modified().ok() != Some(expected))
+    {
+        return Err(AppError::LocalFileChanged);
+    }
+    Ok(())
+}
+
 fn partial_path(destination: &Path, id: Uuid) -> PathBuf {
     let name = destination
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("download");
     destination.with_file_name(format!("{name}.s3fm-partial-{id}"))
+}
+
+fn unique_local_destination(destination: &Path) -> Result<PathBuf, AppError> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("download");
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    for index in 1..=10_000_u32 {
+        let candidate = parent.join(format!("{stem} ({index}){extension}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Validation(
+        "could not find a free renamed destination".to_string(),
+    ))
 }
 
 async fn ensure_collision(
@@ -1483,10 +2149,158 @@ async fn ensure_collision(
         CollisionPolicy::Skip => Err(AppError::TransferStateConflict(
             "destination skipped".to_string(),
         )),
-        CollisionPolicy::Ask | CollisionPolicy::Fail => Err(AppError::Validation(
-            "destination already exists".to_string(),
-        )),
+        CollisionPolicy::Ask | CollisionPolicy::Fail | CollisionPolicy::Rename => Err(
+            AppError::Validation("destination already exists".to_string()),
+        ),
         CollisionPolicy::Replace => Ok(()),
+    }
+}
+
+async fn unique_remote_key(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<String, AppError> {
+    let (parent, filename) = key.rsplit_once('/').unwrap_or(("", key));
+    let (stem, extension) = filename
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map(|(stem, extension)| (stem, format!(".{extension}")))
+        .unwrap_or((filename, String::new()));
+    for index in 1..=10_000_u32 {
+        let candidate_name = format!("{stem} ({index}){extension}");
+        let candidate = if parent.is_empty() {
+            candidate_name
+        } else {
+            format!("{parent}/{candidate_name}")
+        };
+        if !object_exists(client, bucket, &candidate).await? {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Validation(
+        "could not find a free renamed object key".to_string(),
+    ))
+}
+
+async fn prefix_has_objects(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<bool, AppError> {
+    let output = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .max_keys(1)
+        .send()
+        .await
+        .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+    Ok(!output.contents().is_empty() || !output.common_prefixes().is_empty())
+}
+
+async fn object_exists(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<bool, AppError> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(_) => Ok(true),
+        Err(error) if is_not_found_provider_error(&error) => Ok(false),
+        Err(error) => Err(AppError::Provider(safe_provider_error(&error))),
+    }
+}
+
+fn metadata_matches(
+    source: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    destination: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> bool {
+    optional_metadata_value_matches(source.content_type(), destination.content_type())
+        && optional_metadata_value_matches(
+            source.content_disposition(),
+            destination.content_disposition(),
+        )
+        && optional_metadata_value_matches(source.cache_control(), destination.cache_control())
+        && optional_metadata_value_matches(
+            source.content_encoding(),
+            destination.content_encoding(),
+        )
+        && optional_metadata_value_matches(
+            source.content_language(),
+            destination.content_language(),
+        )
+        && optional_metadata_value_matches(source.expires_string(), destination.expires_string())
+        && optional_metadata_value_matches(
+            source.website_redirect_location(),
+            destination.website_redirect_location(),
+        )
+        && user_metadata_matches(source.metadata(), destination.metadata())
+}
+
+fn replacement_metadata_matches(
+    destination: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    replacement: Option<&UploadMetadata>,
+) -> bool {
+    let Some(replacement) = replacement else {
+        return destination
+            .metadata()
+            .map(|values| values.is_empty())
+            .unwrap_or(true);
+    };
+    replacement
+        .content_type
+        .as_deref()
+        .map(|value| destination.content_type() == Some(value))
+        .unwrap_or(true)
+        && replacement
+            .content_disposition
+            .as_deref()
+            .map(|value| destination.content_disposition() == Some(value))
+            .unwrap_or(true)
+        && replacement
+            .cache_control
+            .as_deref()
+            .map(|value| destination.cache_control() == Some(value))
+            .unwrap_or(true)
+        && destination
+            .metadata()
+            .map(|values| {
+                values.len() == replacement.user_metadata.len()
+                    && replacement
+                        .user_metadata
+                        .iter()
+                        .all(|(key, value)| values.get(key) == Some(value))
+            })
+            .unwrap_or(replacement.user_metadata.is_empty())
+}
+
+fn checksums_match(
+    source: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    destination: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> bool {
+    optional_checksum_matches(source.checksum_crc32(), destination.checksum_crc32())
+        && optional_checksum_matches(source.checksum_sha1(), destination.checksum_sha1())
+        && optional_checksum_matches(source.checksum_sha256(), destination.checksum_sha256())
+}
+
+fn optional_checksum_matches(source: Option<&str>, destination: Option<&str>) -> bool {
+    source.is_none() || destination.is_none() || source == destination
+}
+
+fn optional_metadata_value_matches(source: Option<&str>, destination: Option<&str>) -> bool {
+    source.is_none() || source == destination
+}
+
+fn user_metadata_matches(
+    source: Option<&std::collections::HashMap<String, String>>,
+    destination: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    match source {
+        None => true,
+        Some(values) if values.is_empty() => {
+            destination.map(|values| values.is_empty()).unwrap_or(true)
+        }
+        Some(values) => destination == Some(values),
     }
 }
 

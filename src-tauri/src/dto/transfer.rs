@@ -16,6 +16,7 @@ fn default_schema_version() -> u16 {
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransferOperation {
+    CreateFolder,
     UploadFile,
     UploadDirectory,
     DownloadFile,
@@ -30,6 +31,7 @@ pub enum TransferOperation {
 impl TransferOperation {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CreateFolder => "createFolder",
             Self::UploadFile => "uploadFile",
             Self::UploadDirectory => "uploadDirectory",
             Self::DownloadFile => "downloadFile",
@@ -104,6 +106,7 @@ pub enum CollisionPolicy {
     Replace,
     Skip,
     Fail,
+    Rename,
 }
 
 impl CollisionPolicy {
@@ -113,6 +116,7 @@ impl CollisionPolicy {
             Self::Replace => "replace",
             Self::Skip => "skip",
             Self::Fail => "fail",
+            Self::Rename => "rename",
         }
     }
 }
@@ -128,6 +132,18 @@ pub enum TransferEndpoint {
     Local {
         path: String,
     },
+}
+
+/// Optional HTTP metadata applied to uploaded objects. Values are validated at
+/// the command boundary and are never treated as credential material.
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadMetadata {
+    pub content_type: Option<String>,
+    pub content_disposition: Option<String>,
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub user_metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -168,6 +184,9 @@ pub struct TransferSummary {
     pub total_bytes: Option<u64>,
     pub completed_items: u64,
     pub total_items: Option<u64>,
+    pub failed_items: u64,
+    pub speed_bps: Option<u64>,
+    pub eta_seconds: Option<u64>,
     pub created_at: String,
     pub finished_at: Option<String>,
 }
@@ -302,6 +321,17 @@ pub struct StartTransferRequest {
     /// prefix and all matching objects are deleted in bounded batches.
     #[serde(default)]
     pub recursive: bool,
+    /// Upload-directory policy: include the selected folder name in the
+    /// destination prefix when enabled.
+    #[serde(default)]
+    pub preserve_root: bool,
+    /// Copy metadata policy. `false` preserves source metadata; `true` uses
+    /// replacement metadata supplied in `metadata` (or clears it when absent).
+    #[serde(default)]
+    pub replace_metadata: bool,
+    /// Optional HTTP and user metadata for upload operations.
+    #[serde(default)]
+    pub metadata: Option<UploadMetadata>,
     /// Filled by the Rust command boundary when a job is created.  It is
     /// skipped in renderer serialization so settings never become a UI input.
     #[serde(skip)]

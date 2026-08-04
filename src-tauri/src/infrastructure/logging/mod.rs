@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -116,12 +117,14 @@ impl DiagnosticsService {
             ));
         }
         let destination = validate_destination(&request.destination_path)?;
+        self.prune_log_file(settings.log_retention_days, settings.log_max_bytes)
+            .await?;
         let snapshot = DiagnosticsSnapshot {
             schema_version: DTO_SCHEMA_VERSION,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
-            database_schema_version: 3,
+            database_schema_version: 5,
             providers: vec![
                 "awsS3".to_string(),
                 "cloudflareR2".to_string(),
@@ -138,15 +141,77 @@ impl DiagnosticsService {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
         }
+        // Diagnostics are an archive by contract.  Keep the payload as a
+        // single redacted JSON member so support tooling can inspect it
+        // without ever receiving raw logs, secrets, or presigned URLs.
         let temporary = destination.with_extension("tmp");
-        fs::write(&temporary, &bytes).await?;
+        let temporary_for_zip = temporary.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let file = std::fs::File::create(&temporary_for_zip).map_err(AppError::Io)?;
+            let mut archive = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            archive
+                .start_file("diagnostics.json", options)
+                .map_err(|error| {
+                    AppError::Unknown(format!("diagnostics archive failed: {error}"))
+                })?;
+            archive.write_all(&bytes).map_err(AppError::Io)?;
+            archive.finish().map_err(|error| {
+                AppError::Unknown(format!("diagnostics archive failed: {error}"))
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            AppError::Unknown(format!("diagnostics archive worker failed: {error}"))
+        })??;
         fs::rename(&temporary, &destination).await?;
+        let bytes_written = fs::metadata(&destination).await?.len();
         Ok(DiagnosticsExportResult {
             schema_version: DTO_SCHEMA_VERSION,
             path: destination.to_string_lossy().into_owned(),
-            bytes_written: bytes.len() as u64,
+            bytes_written,
             redacted: true,
         })
+    }
+
+    async fn prune_log_file(&self, retention_days: u16, max_bytes: u64) -> Result<(), AppError> {
+        let Ok(bytes) = fs::read(self.log_file.as_ref()).await else {
+            return Ok(());
+        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let mut kept = VecDeque::new();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let keep = serde_json::from_slice::<DiagnosticLogEntry>(line)
+                .ok()
+                .and_then(|entry| chrono::DateTime::parse_from_rfc3339(&entry.timestamp).ok())
+                .is_some_and(|timestamp| timestamp.with_timezone(&chrono::Utc) >= cutoff);
+            if keep {
+                kept.push_back(line.to_vec());
+            }
+        }
+        let mut output = Vec::new();
+        for line in kept.into_iter().rev() {
+            if output.len().saturating_add(line.len() + 1) > max_bytes as usize {
+                break;
+            }
+            output.extend_from_slice(&line);
+            output.push(b'\n');
+        }
+        output.reverse();
+        if output.len() < bytes.len() {
+            let temporary = self.log_file.with_extension("tmp");
+            fs::write(&temporary, output).await?;
+            fs::rename(temporary, self.log_file.as_ref()).await?;
+        }
+        Ok(())
     }
 }
 
@@ -163,7 +228,15 @@ fn validate_destination(value: &str) -> Result<PathBuf, AppError> {
             "diagnostics destination must be a file".to_string(),
         ));
     }
-    Ok(path.to_path_buf())
+    let mut destination = path.to_path_buf();
+    if destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("zip")
+    {
+        destination.set_extension("zip");
+    }
+    Ok(destination)
 }
 
 fn sanitize_token(value: &str) -> String {

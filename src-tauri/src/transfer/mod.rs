@@ -5,7 +5,11 @@ pub mod scheduler;
 pub mod settings;
 pub mod state;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
@@ -17,8 +21,9 @@ use crate::{
         ClearTransferHistoryRequest, ListTransfersRequest, StartTransferRequest,
         TransferChannelMessage, TransferDetails, TransferEndpoint, TransferHistoryPage,
         TransferJob, TransferOperation, TransferProgress, TransferResult, TransferStatus,
-        TransferSummary, DTO_SCHEMA_VERSION,
+        TransferSummary, UploadMetadata, DTO_SCHEMA_VERSION,
     },
+    infrastructure::database::Database,
 };
 
 use self::retry::RetryPolicy;
@@ -30,6 +35,9 @@ struct RuntimeJob {
     request: StartTransferRequest,
     cancel_requested: bool,
     pause_requested: bool,
+    last_progress_at: Option<Instant>,
+    last_progress_bytes: u64,
+    ewma_speed_bps: Option<f64>,
 }
 
 /// Session-scoped transfer coordinator. Provider-specific workers are layered
@@ -40,6 +48,7 @@ pub struct TransferManager {
     events: broadcast::Sender<TransferChannelMessage>,
     scheduler: TransferScheduler,
     retry_policy: RetryPolicy,
+    database: Option<Database>,
 }
 
 impl Default for TransferManager {
@@ -50,6 +59,17 @@ impl Default for TransferManager {
 
 impl TransferManager {
     pub fn new(max_concurrent_jobs: usize) -> Self {
+        Self::build(max_concurrent_jobs, None)
+    }
+
+    /// Construct a manager backed by the local SQLite history database.
+    /// Keeping this constructor separate preserves lightweight unit tests and
+    /// callers that intentionally use an in-memory session manager.
+    pub fn new_with_database(max_concurrent_jobs: usize, database: Database) -> Self {
+        Self::build(max_concurrent_jobs, Some(database))
+    }
+
+    fn build(max_concurrent_jobs: usize, database: Option<Database>) -> Self {
         let (events, _) = broadcast::channel(256);
         let max_concurrent_jobs = max_concurrent_jobs.clamp(1, 16);
         let scheduler = TransferScheduler::new(SchedulerConfig {
@@ -61,7 +81,63 @@ impl TransferManager {
             events,
             scheduler,
             retry_policy: RetryPolicy::default(),
+            database,
         }
+    }
+
+    async fn persist_snapshot(&self, job: &TransferJob, request: &StartTransferRequest) {
+        let Some(database) = self.database.as_ref() else {
+            return;
+        };
+        if let Err(error) = database.save_transfer(job, request).await {
+            // Transfer execution remains session-safe if the history disk is
+            // temporarily unavailable.  The warning is actionable in the
+            // diagnostics log and avoids leaking a provider credential.
+            tracing::warn!(transfer_id = %job.id, error = %error, "unable to persist transfer snapshot");
+        }
+        if job.status.is_terminal() {
+            let (retention_days, max_jobs) = request
+                .settings_snapshot
+                .as_ref()
+                .map(|settings| {
+                    (
+                        u32::from(settings.transfer_history_days),
+                        settings.transfer_history_max_jobs,
+                    )
+                })
+                .unwrap_or((30, 1_000));
+            if let Err(error) = database
+                .prune_transfer_history(retention_days, max_jobs)
+                .await
+            {
+                tracing::warn!(error = %error, "unable to prune transfer history");
+            }
+        }
+    }
+
+    /// Recover durable jobs after opening the app.  Active jobs are first
+    /// marked Interrupted in one database update; no provider request is
+    /// resumed automatically.  Interrupted rows remain retryable because the
+    /// sanitized request is hydrated into the session manager.
+    pub async fn recover_from_database(&self) -> Result<usize, AppError> {
+        let Some(database) = self.database.as_ref() else {
+            return Ok(0);
+        };
+        let marked = database.mark_active_transfers_interrupted().await?;
+        let persisted = database.list_transfers().await?;
+        let mut jobs = self.jobs.write().await;
+        for transfer in persisted {
+            jobs.entry(transfer.job.id).or_insert_with(|| RuntimeJob {
+                cancel_requested: false,
+                pause_requested: false,
+                last_progress_at: None,
+                last_progress_bytes: 0,
+                ewma_speed_bps: None,
+                job: transfer.job,
+                request: transfer.request,
+            });
+        }
+        Ok(marked as usize)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransferChannelMessage> {
@@ -122,6 +198,9 @@ impl TransferManager {
                 request: request.clone(),
                 cancel_requested: false,
                 pause_requested: false,
+                last_progress_at: None,
+                last_progress_bytes: 0,
+                ewma_speed_bps: None,
             },
         );
         if let Err(error) = self
@@ -134,6 +213,7 @@ impl TransferManager {
                 "unable to queue transfer: {error:?}"
             )));
         }
+        self.persist_snapshot(&job, &request).await;
         let _ = self
             .events
             .send(TransferChannelMessage::Snapshot(job.clone()));
@@ -191,6 +271,15 @@ impl TransferManager {
         })
     }
 
+    pub async fn active_count(&self) -> usize {
+        self.jobs
+            .read()
+            .await
+            .values()
+            .filter(|runtime| runtime.job.status.is_active())
+            .count()
+    }
+
     pub async fn list(&self, include_active: bool) -> Vec<TransferSummary> {
         let mut values = self
             .jobs
@@ -207,6 +296,9 @@ impl TransferManager {
                 total_bytes: runtime.job.total_bytes,
                 completed_items: runtime.job.completed_items,
                 total_items: runtime.job.total_items,
+                failed_items: runtime.job.failed_items,
+                speed_bps: runtime.job.speed_bps,
+                eta_seconds: runtime.job.eta_seconds,
                 created_at: runtime.job.created_at.clone(),
                 finished_at: runtime.job.finished_at.clone(),
             })
@@ -274,8 +366,10 @@ impl TransferManager {
             ));
         }
         let before = request.before.as_deref();
-        let mut jobs = self.jobs.write().await;
-        let ids = jobs
+        let ids = self
+            .jobs
+            .read()
+            .await
             .iter()
             .filter(|(_, runtime)| {
                 if !runtime.job.status.is_terminal() {
@@ -295,7 +389,11 @@ impl TransferManager {
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        if let Some(database) = self.database.as_ref() {
+            database.delete_transfers(&ids).await?;
+        }
         let count = ids.len();
+        let mut jobs = self.jobs.write().await;
         for id in ids {
             jobs.remove(&id);
         }
@@ -319,12 +417,18 @@ impl TransferManager {
                 "only finished transfers can be retried".to_string(),
             ));
         }
-        let mut next = self.create(request).await?;
-        let mut jobs = self.jobs.write().await;
-        if let Some(runtime) = jobs.get_mut(&next.id) {
-            runtime.job.retry_count = old_retry_count.saturating_add(1);
-            next = runtime.job.clone();
-        }
+        let mut next = self.create(request.clone()).await?;
+        let (next_job, next_request) = {
+            let mut jobs = self.jobs.write().await;
+            if let Some(runtime) = jobs.get_mut(&next.id) {
+                runtime.job.retry_count = old_retry_count.saturating_add(1);
+                next = runtime.job.clone();
+                (runtime.job.clone(), runtime.request.clone())
+            } else {
+                (next.clone(), request)
+            }
+        };
+        self.persist_snapshot(&next_job, &next_request).await;
         Ok(next)
     }
 
@@ -339,6 +443,9 @@ impl TransferManager {
             .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
         let current = runtime.job.status;
         runtime.job.status = state::transition(current, next).map_err(AppError::Validation)?;
+        if next == TransferStatus::Retrying {
+            runtime.job.retry_count = runtime.job.retry_count.saturating_add(1);
+        }
         if matches!(next, TransferStatus::Running) && runtime.job.started_at.is_none() {
             runtime.job.started_at = Some(Utc::now().to_rfc3339());
         }
@@ -346,7 +453,9 @@ impl TransferManager {
             runtime.job.finished_at = Some(Utc::now().to_rfc3339());
         }
         let job = runtime.job.clone();
+        let request = runtime.request.clone();
         drop(jobs);
+        self.persist_snapshot(&job, &request).await;
         let _ = self.events.send(TransferChannelMessage::StateChanged(next));
         let _ = self
             .events
@@ -364,16 +473,27 @@ impl TransferManager {
                 "queued transfers cannot be paused".to_string(),
             ));
         }
-        if matches!(
-            current.operation,
-            TransferOperation::UploadFile
-                | TransferOperation::DownloadFile
-                | TransferOperation::CopyObject
-                | TransferOperation::MoveObject
-                | TransferOperation::DeleteObjects
-        ) {
+        let pause_supported = match current.operation {
+            TransferOperation::DeleteObjects => self.request(id).await.is_some_and(|request| {
+                request.recursive
+                    || matches!(
+                        &request.source,
+                        TransferEndpoint::Remote { key, .. } if key.ends_with('/')
+                    )
+            }),
+            TransferOperation::CreateFolder
+            | TransferOperation::UploadFile
+            | TransferOperation::CopyObject
+            | TransferOperation::MoveObject => false,
+            TransferOperation::DownloadFile => true,
+            TransferOperation::UploadDirectory
+            | TransferOperation::DownloadPrefix
+            | TransferOperation::CopyPrefix
+            | TransferOperation::MovePrefix => true,
+        };
+        if !pause_supported {
             return Err(AppError::Validation(
-                "pause is supported only for recursive transfers".to_string(),
+                "pause is not supported for this transfer".to_string(),
             ));
         }
         let job = self.transition(id, TransferStatus::Pausing).await?;
@@ -448,10 +568,50 @@ impl TransferManager {
                 "cannot update a finished transfer".to_string(),
             ));
         }
+        let now = Instant::now();
+        let sample_speed = runtime.last_progress_at.and_then(|previous| {
+            let elapsed = now.duration_since(previous).as_secs_f64();
+            if elapsed <= 0.0 {
+                None
+            } else {
+                Some(transferred_bytes.saturating_sub(runtime.last_progress_bytes) as f64 / elapsed)
+            }
+        });
+        if let Some(sample_speed) = sample_speed {
+            // Five-second EWMA: alpha approaches one for a long gap and
+            // remains smooth for the normal 5 Hz progress cadence.
+            let alpha = 1.0
+                - (-now
+                    .duration_since(runtime.last_progress_at.unwrap_or(now))
+                    .as_secs_f64()
+                    / 5.0)
+                    .exp();
+            runtime.ewma_speed_bps = Some(
+                runtime
+                    .ewma_speed_bps
+                    .map(|previous| previous + alpha * (sample_speed - previous))
+                    .unwrap_or(sample_speed),
+            );
+        }
+        runtime.last_progress_at = Some(now);
+        runtime.last_progress_bytes = transferred_bytes;
+        let computed_speed = runtime
+            .ewma_speed_bps
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .map(|value| value.round() as u64);
+        let effective_speed = speed_bps.or(computed_speed);
+        let computed_eta = runtime.job.total_bytes.and_then(|total| {
+            effective_speed
+                .filter(|speed| *speed > 0 && total > transferred_bytes)
+                .map(|speed| (total - transferred_bytes).div_ceil(speed))
+        });
+        let effective_eta = eta_seconds.or(computed_eta);
         runtime.job.transferred_bytes = transferred_bytes;
         runtime.job.completed_items = completed_items;
-        runtime.job.speed_bps = speed_bps;
-        runtime.job.eta_seconds = eta_seconds;
+        runtime.job.speed_bps = effective_speed;
+        runtime.job.eta_seconds = effective_eta;
+        let job = runtime.job.clone();
+        let request = runtime.request.clone();
         let progress = TransferProgress {
             schema_version: DTO_SCHEMA_VERSION,
             transfer_id: id,
@@ -460,14 +620,42 @@ impl TransferManager {
             total_bytes: runtime.job.total_bytes,
             completed_items,
             total_items: runtime.job.total_items,
-            speed_bps,
-            eta_seconds,
+            speed_bps: effective_speed,
+            eta_seconds: effective_eta,
         };
         drop(jobs);
+        self.persist_snapshot(&job, &request).await;
         let _ = self
             .events
             .send(TransferChannelMessage::Progress(progress.clone()));
         Ok(progress)
+    }
+
+    pub async fn set_totals(
+        &self,
+        id: Uuid,
+        total_items: Option<u64>,
+        total_bytes: Option<u64>,
+    ) -> Result<TransferJob, AppError> {
+        let mut jobs = self.jobs.write().await;
+        let runtime = jobs
+            .get_mut(&id)
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        if !runtime.job.status.is_active() {
+            return Err(AppError::Validation(
+                "cannot update totals for a finished transfer".to_string(),
+            ));
+        }
+        runtime.job.total_items = total_items;
+        runtime.job.total_bytes = total_bytes;
+        let job = runtime.job.clone();
+        let request = runtime.request.clone();
+        drop(jobs);
+        self.persist_snapshot(&job, &request).await;
+        let _ = self
+            .events
+            .send(TransferChannelMessage::Snapshot(job.clone()));
+        Ok(job)
     }
 
     pub async fn set_error(&self, id: Uuid, error: AppError) -> Result<(), AppError> {
@@ -478,7 +666,9 @@ impl TransferManager {
             .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
         runtime.job.error = Some(public_error);
         let snapshot = runtime.job.clone();
+        let request = runtime.request.clone();
         drop(jobs);
+        self.persist_snapshot(&snapshot, &request).await;
         let _ = self.events.send(TransferChannelMessage::Snapshot(snapshot));
         Ok(())
     }
@@ -502,15 +692,18 @@ impl TransferManager {
             ));
         }
         self.transition(id, status).await?;
-        {
+        let (final_job, final_request) = {
             let mut jobs = self.jobs.write().await;
             if let Some(runtime) = jobs.get_mut(&id) {
                 runtime.job.failed_items = failed_items;
+                (runtime.job.clone(), runtime.request.clone())
+            } else {
+                return Err(AppError::Unknown(format!(
+                    "transfer disappeared while finishing: {id}"
+                )));
             }
-        }
-        let final_job = self.get(id).await.ok_or_else(|| {
-            AppError::Unknown(format!("transfer disappeared while finishing: {id}"))
-        })?;
+        };
+        self.persist_snapshot(&final_job, &final_request).await;
         let result = TransferResult {
             schema_version: DTO_SCHEMA_VERSION,
             transfer_id: id,
@@ -600,7 +793,8 @@ impl TransferManager {
 
 fn priority_for_operation(operation: TransferOperation) -> JobPriority {
     match operation {
-        TransferOperation::UploadFile
+        TransferOperation::CreateFolder
+        | TransferOperation::UploadFile
         | TransferOperation::DownloadFile
         | TransferOperation::CopyObject
         | TransferOperation::MoveObject => JobPriority::INTERACTIVE,
@@ -613,6 +807,40 @@ fn priority_for_operation(operation: TransferOperation) -> JobPriority {
 }
 
 fn validate_request(request: &StartTransferRequest) -> Result<(), AppError> {
+    if let Some(metadata) = request.metadata.as_ref() {
+        let upload_operation = matches!(
+            request.operation,
+            TransferOperation::UploadFile | TransferOperation::UploadDirectory
+        );
+        if !upload_operation
+            && !(request.replace_metadata
+                && matches!(
+                    request.operation,
+                    TransferOperation::CopyObject
+                        | TransferOperation::CopyPrefix
+                        | TransferOperation::MoveObject
+                        | TransferOperation::MovePrefix
+                ))
+        {
+            return Err(AppError::Validation(
+                "metadata is only valid for upload or replacement-copy operations".to_string(),
+            ));
+        }
+        validate_upload_metadata(metadata)?;
+    }
+    if request.replace_metadata
+        && !matches!(
+            request.operation,
+            TransferOperation::CopyObject
+                | TransferOperation::CopyPrefix
+                | TransferOperation::MoveObject
+                | TransferOperation::MovePrefix
+        )
+    {
+        return Err(AppError::Validation(
+            "replaceMetadata is only valid for copy or move operations".to_string(),
+        ));
+    }
     if request.total_items == Some(0) {
         return Err(AppError::Validation(
             "totalItems must be greater than zero".to_string(),
@@ -624,6 +852,18 @@ fn validate_request(request: &StartTransferRequest) -> Result<(), AppError> {
         ));
     }
     match request.operation {
+        TransferOperation::CreateFolder => {
+            validate_remote_endpoint(
+                &request.source,
+                request.profile_id.as_deref(),
+                "folder destination",
+            )?;
+            if request.destination.is_some() {
+                return Err(AppError::Validation(
+                    "create-folder operation cannot have a destination".to_string(),
+                ));
+            }
+        }
         TransferOperation::UploadFile | TransferOperation::UploadDirectory => {
             validate_local_endpoint(&request.source, "upload source")?;
             let destination = request.destination.as_ref().ok_or_else(|| {
@@ -668,6 +908,56 @@ fn validate_request(request: &StartTransferRequest) -> Result<(), AppError> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_upload_metadata(metadata: &UploadMetadata) -> Result<(), AppError> {
+    for (field, value, max_bytes) in [
+        ("contentType", metadata.content_type.as_deref(), 256_usize),
+        (
+            "contentDisposition",
+            metadata.content_disposition.as_deref(),
+            1_024_usize,
+        ),
+        (
+            "cacheControl",
+            metadata.cache_control.as_deref(),
+            1_024_usize,
+        ),
+    ] {
+        if let Some(value) = value {
+            if value.trim().is_empty()
+                || value.len() > max_bytes
+                || value.chars().any(char::is_control)
+            {
+                return Err(AppError::Validation(format!("{field} is invalid")));
+            }
+        }
+    }
+    if metadata.user_metadata.len() > 100 {
+        return Err(AppError::Validation(
+            "userMetadata cannot contain more than 100 entries".to_string(),
+        ));
+    }
+    let total_bytes = metadata
+        .user_metadata
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()))
+        .sum::<usize>();
+    if total_bytes > 8_192
+        || metadata.user_metadata.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > 128
+                || !key.is_ascii()
+                || value.len() > 2_048
+                || key.chars().any(char::is_control)
+                || value.chars().any(char::is_control)
+        })
+    {
+        return Err(AppError::Validation(
+            "userMetadata contains an invalid key or value".to_string(),
+        ));
     }
     Ok(())
 }
@@ -735,6 +1025,9 @@ mod tests {
             total_items: Some(1),
             confirmation: None,
             recursive: false,
+            preserve_root: false,
+            replace_metadata: false,
+            metadata: None,
             settings_snapshot: None,
         }
     }
@@ -834,6 +1127,77 @@ mod tests {
         let database = Database::connect(&path)
             .await
             .expect("all embedded migrations should apply");
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn durable_history_recovers_running_jobs_as_interrupted() {
+        use crate::domain::profile::{ConnectionProfile, SecretReference};
+        use crate::domain::provider::{AddressingStyle, CredentialMode, ProviderType};
+        use crate::infrastructure::database::Database;
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "s3-file-manager-transfer-recovery-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let database = Database::connect(&path).await.unwrap();
+        let profile_id = Uuid::new_v4();
+        database
+            .insert_profile(&ConnectionProfile {
+                id: profile_id,
+                name: "Recovery test".to_string(),
+                provider: ProviderType::CustomS3,
+                endpoint: Some("https://s3.example.test".to_string()),
+                region: "us-east-1".to_string(),
+                credential_mode: CredentialMode::Static,
+                access_key_id: Some("access-key".to_string()),
+                secret_reference: Some(SecretReference::new(profile_id, "test")),
+                session_reference: None,
+                default_bucket: Some("bucket".to_string()),
+                root_prefix: None,
+                addressing_style: AddressingStyle::Path,
+                allow_insecure_http: false,
+                favorite: false,
+                favorite_order: 0,
+                revision: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let manager = TransferManager::new_with_database(1, database.clone());
+        let mut original_request = request();
+        original_request.profile_id = Some(profile_id.to_string());
+        original_request.destination = Some(TransferEndpoint::Remote {
+            profile_id: profile_id.to_string(),
+            bucket: "bucket".to_string(),
+            key: "file.txt".to_string(),
+        });
+        original_request.confirmation = Some("one-shot-confirmation".to_string());
+        let job = manager.create(original_request).await.unwrap();
+        let permit = manager.acquire_next().await.unwrap();
+        manager
+            .transition(job.id, TransferStatus::Running)
+            .await
+            .unwrap();
+        drop(permit);
+
+        let recovered = TransferManager::new_with_database(1, database.clone());
+        assert_eq!(recovered.recover_from_database().await.unwrap(), 1);
+        let interrupted = recovered.get(job.id).await.unwrap();
+        assert_eq!(interrupted.status, TransferStatus::Interrupted);
+        let persisted = database.list_transfers().await.unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].job.id, job.id);
+        assert!(persisted[0].request.confirmation.is_none());
+
+        let retry = recovered.retry(job.id).await.unwrap();
+        assert_eq!(retry.status, TransferStatus::Queued);
+        assert_eq!(retry.retry_count, 1);
+
         drop(database);
         let _ = std::fs::remove_file(path);
     }

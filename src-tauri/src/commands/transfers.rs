@@ -89,6 +89,11 @@ pub async fn clear_transfer_history(
         .map_err(Into::into)
 }
 
+#[command]
+pub async fn interrupt_active_transfers(state: State<'_, AppState>) -> Result<usize, PublicError> {
+    Ok(state.transfers.interrupt_active().await)
+}
+
 #[allow(clippy::result_large_err)]
 fn parse_id(value: &str) -> Result<Uuid, PublicError> {
     Uuid::parse_str(value).map_err(|_| {

@@ -45,6 +45,30 @@ pub struct ConnectionProfile {
 
 impl ConnectionProfile {
     pub fn validate(&self) -> Result<(), AppError> {
+        self.validate_configuration()?;
+        if self.access_key_id.as_deref().unwrap_or("").is_empty() {
+            return Err(AppError::Validation(
+                "Access key ID is required for credentials".to_string(),
+            ));
+        }
+        if self.secret_reference.is_none() {
+            return Err(AppError::Validation(
+                "A stored secret is required for credentials".to_string(),
+            ));
+        }
+        if self.credential_mode == CredentialMode::TemporarySession
+            && self.session_reference.is_none()
+        {
+            return Err(AppError::Validation(
+                "Session token is required for temporary credentials".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the portable provider/profile configuration without requiring
+    /// credentials. Imported profiles use this before local credential entry.
+    pub fn validate_configuration(&self) -> Result<(), AppError> {
         if self.name.trim().is_empty() || self.name.chars().count() > 80 {
             return Err(AppError::Validation(
                 "Profile name must be 1–80 characters".to_string(),
@@ -146,23 +170,6 @@ impl ConnectionProfile {
                 ))
             }
             _ => {}
-        }
-        if self.access_key_id.as_deref().unwrap_or("").is_empty() {
-            return Err(AppError::Validation(
-                "Access key ID is required for credentials".to_string(),
-            ));
-        }
-        if self.secret_reference.is_none() {
-            return Err(AppError::Validation(
-                "A stored secret is required for credentials".to_string(),
-            ));
-        }
-        if self.credential_mode == CredentialMode::TemporarySession
-            && self.session_reference.is_none()
-        {
-            return Err(AppError::Validation(
-                "Session token is required for temporary credentials".to_string(),
-            ));
         }
         Ok(())
     }
