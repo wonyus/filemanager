@@ -88,6 +88,35 @@ pub enum AppError {
     Unknown(String),
 }
 
+/// Recognize only provider messages that clearly describe an expired or
+/// invalid session/security token. This intentionally does not classify an
+/// invalid access-key ID or a generic expired request/presigned URL as an
+/// expired credential.
+pub fn is_credential_expired_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("credential expired") {
+        return true;
+    }
+    let expired_token_code = lower.contains("expiredtoken") || lower.contains("expired_token");
+    let expired_session = (lower.contains("security token")
+        || lower.contains("session token")
+        || lower.contains("credential"))
+        && lower.contains("expired");
+    let invalid_token_code = lower == "invalidtoken" || lower.starts_with("invalidtoken:");
+    let invalid_session = (invalid_token_code
+        || lower.contains("invalidtoken")
+        || lower.contains("invalid_token")
+        || lower.contains("invalid token")
+        || lower.contains("invalidsecuritytoken")
+        || lower.contains("invalidsessiontoken")
+        || lower.contains("sessiontokeninvalid")
+        || lower.contains("tokeninvalid"))
+        && (lower.contains("security")
+            || lower.contains("session")
+            || lower.contains("credential"));
+    expired_token_code || expired_session || invalid_session
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicError {
@@ -127,6 +156,11 @@ impl From<AppError> for PublicError {
                 AppErrorCode::ProfileNotFound,
                 false,
                 "The requested profile was not found.".to_string(),
+            ),
+            AppError::Provider(message) if is_credential_expired_message(message) => (
+                AppErrorCode::CredentialExpired,
+                false,
+                "The credential has expired; update the profile and try again.".to_string(),
             ),
             AppError::Provider(_) => (
                 AppErrorCode::ProviderUnavailable,
@@ -230,5 +264,31 @@ impl From<AppError> for PublicError {
             field_errors: BTreeMap::new(),
             details: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_credential_expired_message, AppError, AppErrorCode, PublicError};
+
+    #[test]
+    fn recognizes_expired_or_invalid_session_tokens_only() {
+        assert!(is_credential_expired_message(
+            "ExpiredToken: The security token included in the request is expired"
+        ));
+        assert!(is_credential_expired_message("InvalidSessionToken"));
+        assert!(is_credential_expired_message("credential expired"));
+        assert!(!is_credential_expired_message("InvalidAccessKeyId"));
+        assert!(!is_credential_expired_message("Request has expired"));
+        assert!(!is_credential_expired_message("AccessDenied"));
+    }
+
+    #[test]
+    fn maps_provider_expiry_to_public_credential_expired_code() {
+        let error = PublicError::from(AppError::Provider(
+            "ExpiredToken: security token is expired".to_string(),
+        ));
+        assert!(matches!(error.code, AppErrorCode::CredentialExpired));
+        assert!(!error.retryable);
     }
 }

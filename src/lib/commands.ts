@@ -27,6 +27,7 @@ import type {
   SettingsSnapshot,
   StartTransferRequest,
   TransferHistoryPage,
+  TransferDetails,
   TransferJob,
   UpdateCheckResult,
 } from "./types";
@@ -123,6 +124,8 @@ export const commands = {
         offset: 0,
       },
     }),
+  getTransferDetails: (transferId: string) =>
+    invoke<TransferDetails>("get_transfer_details", { transferId }),
   pauseTransfer: (transferId: string) =>
     invoke<TransferJob>("pause_transfer", { transferId }),
   resumeTransfer: (transferId: string) =>
@@ -144,4 +147,10 @@ export const commands = {
     invoke<DiagnosticsExportResult>("export_diagnostics", { request }),
   clearLogs: () => invoke<number>("clear_logs"),
   checkForUpdates: () => invoke<UpdateCheckResult>("check_for_updates"),
+  pickFile: () => invoke<string | null>("pick_file"),
+  pickDirectory: () => invoke<string | null>("pick_directory"),
+  pickSaveFile: (defaultName?: string) =>
+    invoke<string | null>("pick_save_file", { defaultName }),
+  openDestinationFolder: (path: string) =>
+    invoke<void>("open_destination_folder", { path }),
 };

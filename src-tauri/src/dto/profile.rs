@@ -224,7 +224,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionTestResult {
     pub schema_version: u16,

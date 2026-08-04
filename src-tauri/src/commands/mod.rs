@@ -5,4 +5,5 @@ pub mod explorer_state;
 pub mod metadata;
 pub mod profiles;
 pub mod settings;
+pub mod system;
 pub mod transfers;

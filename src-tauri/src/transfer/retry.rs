@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::domain::error::AppError;
+use crate::domain::error::{is_credential_expired_message, AppError};
 
 /// Coarse error classes used by the scheduler.  The provider adapters can map
 /// their richer SDK errors into these classes without leaking provider details
@@ -93,6 +93,9 @@ pub fn classify_error(error: &AppError) -> RetryClass {
 
 fn classify_provider_message(message: &str) -> RetryClass {
     let lower = message.to_ascii_lowercase();
+    if is_credential_expired_message(message) {
+        return RetryClass::NonRetryable;
+    }
     if [
         "accessdenied",
         "access denied",
@@ -164,6 +167,12 @@ mod tests {
         );
         assert_eq!(
             classify_error(&AppError::Provider("AccessDenied".to_string())),
+            RetryClass::NonRetryable
+        );
+        assert_eq!(
+            classify_error(&AppError::Provider(
+                "ExpiredToken: The security token included in the request is expired".to_string()
+            )),
             RetryClass::NonRetryable
         );
         assert_eq!(

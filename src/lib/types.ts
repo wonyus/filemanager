@@ -97,6 +97,24 @@ export interface TransferSummary {
   finishedAt?: string;
 }
 
+export interface TransferItem {
+  schemaVersion: number;
+  id: string;
+  sourceKey?: string;
+  destinationKey?: string;
+  localPath?: string;
+  sizeBytes?: number;
+  status: TransferStatus;
+  retryCount: number;
+  error?: PublicError;
+}
+
+export interface TransferDetails {
+  schemaVersion: number;
+  job: TransferJob;
+  items: TransferItem[];
+}
+
 export interface TransferHistoryPage {
   schemaVersion: number;
   items: TransferSummary[];
@@ -342,6 +360,8 @@ export interface ObjectMetadata {
   previewSupported: boolean;
   previewKind?: "text" | "image" | "audio" | "video" | "pdf";
   previewReason?: string;
+  shareSupported: boolean;
+  shareReason?: string;
 }
 
 export interface MetadataEditRequest extends ObjectRequest {

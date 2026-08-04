@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -13,7 +13,8 @@ use aws_sdk_s3::{
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
+    task::JoinSet,
 };
 use uuid::Uuid;
 
@@ -21,13 +22,32 @@ const MAX_IN_MEMORY_PART_BYTES: u64 = 64 * 1024 * 1024;
 const SINGLE_COPY_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MULTIPART_COPY_PART_BYTES: u64 = 64 * 1024 * 1024;
 
+fn multipart_copy_ranges(source_size: u64) -> Result<Vec<(i32, u64, u64)>, AppError> {
+    let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
+    if part_count > 10_000 {
+        return Err(AppError::Validation(
+            "object requires too many multipart copy parts".to_string(),
+        ));
+    }
+    Ok((0..part_count)
+        .map(|index| {
+            let start = index.saturating_mul(MULTIPART_COPY_PART_BYTES);
+            let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
+            (i32::try_from(index + 1).unwrap_or(i32::MAX), start, end)
+        })
+        .collect())
+}
+
 use crate::{
     application::profile_service::ProfileService,
-    domain::{error::AppError, profile::ConnectionProfile},
+    domain::{
+        error::{is_credential_expired_message, AppError},
+        profile::ConnectionProfile,
+    },
     dto::{
         settings::SettingsSnapshot,
         transfer::{
-            CollisionPolicy, StartTransferRequest, TransferEndpoint, TransferJob,
+            CollisionPolicy, StartTransferRequest, TransferEndpoint, TransferItem, TransferJob,
             TransferOperation, TransferStatus, UploadMetadata,
         },
     },
@@ -54,6 +74,7 @@ struct ExecutionOutcome {
     failed_items: u64,
     cleanup_required_items: u64,
     status: TransferStatus,
+    skipped: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -72,6 +93,18 @@ impl ExecutionOutcome {
             failed_items: 0,
             cleanup_required_items: 0,
             status: TransferStatus::Completed,
+            skipped: false,
+        }
+    }
+
+    fn skipped() -> Self {
+        Self {
+            transferred_bytes: 0,
+            completed_items: 1,
+            failed_items: 0,
+            cleanup_required_items: 0,
+            status: TransferStatus::Completed,
+            skipped: true,
         }
     }
 }
@@ -299,8 +332,10 @@ impl TransferService {
             return Err(error);
         }
         if size >= settings.multipart_threshold_bytes {
+            let profile_id = profile.id.to_string();
             self.upload_multipart(
                 id,
+                Some(&profile_id),
                 &client,
                 &bucket,
                 &key,
@@ -394,6 +429,7 @@ impl TransferService {
     async fn upload_multipart(
         &self,
         id: Uuid,
+        profile_id: Option<&str>,
         client: &aws_sdk_s3::Client,
         bucket: &str,
         key: &str,
@@ -435,17 +471,74 @@ impl TransferService {
             .upload_id()
             .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
             .to_string();
-        let mut file = File::open(source).await?;
-        let mut completed = Vec::with_capacity(part_count as usize);
+
+        // Persist the provider handle before uploading the first part. If the
+        // local checkpoint cannot be written, abort the provider upload so an
+        // orphaned multipart session is not created by a local disk failure.
+        if let Err(error) = self
+            .manager
+            .persist_multipart_upload(id, profile_id, bucket, key, &upload_id, part_size)
+            .await
+        {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(error);
+        }
+
+        let part_concurrency = usize::from(settings.per_job_part_concurrency.clamp(1, 16));
+        let permits = Arc::new(Semaphore::new(part_concurrency));
+        let mut in_flight = JoinSet::new();
+        let mut completed = BTreeMap::<i32, (String, u64)>::new();
         let mut transferred = 0_u64;
         let mut part_number = 1_i32;
+
+        async fn join_part(
+            in_flight: &mut JoinSet<Result<(i32, String, u64), AppError>>,
+        ) -> Result<(i32, String, u64), AppError> {
+            let joined = in_flight
+                .join_next()
+                .await
+                .ok_or_else(|| AppError::Unknown("multipart part queue ended early".to_string()))?;
+            joined.map_err(|error| {
+                AppError::Unknown(format!("multipart part task failed: {error}"))
+            })?
+        }
+
+        async fn record_part(
+            manager: &TransferManager,
+            transfer_id: Uuid,
+            completed: &mut BTreeMap<i32, (String, u64)>,
+            transferred: &mut u64,
+            part: (i32, String, u64),
+        ) -> Result<(), AppError> {
+            let (part_number, etag, size_bytes) = part;
+            manager
+                .persist_multipart_part(
+                    transfer_id,
+                    u32::try_from(part_number).map_err(|_| {
+                        AppError::Unknown("multipart part number overflow".to_string())
+                    })?,
+                    &etag,
+                    size_bytes,
+                )
+                .await?;
+            completed.insert(part_number, (etag, size_bytes));
+            *transferred = transferred.saturating_add(size_bytes);
+            manager
+                .update_progress(transfer_id, *transferred, 0, None, None)
+                .await?;
+            Ok(())
+        }
+
         let result = async {
+            let mut file = File::open(source).await?;
             loop {
-                if self.manager.is_cancel_requested(id).await {
-                    return Err(AppError::TransferStateConflict(
-                        "transfer cancelled".to_string(),
-                    ));
-                }
+                self.manager.checkpoint(id).await?;
                 let mut buffer = vec![0_u8; part_size as usize];
                 let mut read = 0_usize;
                 while read < buffer.len() {
@@ -459,33 +552,55 @@ impl TransferService {
                     break;
                 }
                 buffer.truncate(read);
-                let output = client
-                    .upload_part()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(ByteStream::from(buffer))
-                    .send()
-                    .await
-                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-                let etag = output.e_tag().ok_or_else(|| {
-                    AppError::Provider("provider did not return a part ETag".to_string())
+                let permit = permits.clone().acquire_owned().await.map_err(|_| {
+                    AppError::TransferStateConflict(
+                        "multipart part scheduler is unavailable".to_string(),
+                    )
                 })?;
-                completed.push(
-                    CompletedPart::builder()
-                        .part_number(part_number)
-                        .e_tag(etag)
-                        .build(),
-                );
-                transferred += read as u64;
-                self.manager
-                    .update_progress(id, transferred, 0, None, None)
-                    .await?;
+                let part_id = part_number;
+                let part_bytes = read as u64;
+                let part_bucket = bucket.to_string();
+                let part_key = key.to_string();
+                let part_upload_id = upload_id.clone();
+                let part_client = client.clone();
+                in_flight.spawn(async move {
+                    let _permit = permit;
+                    let output = part_client
+                        .upload_part()
+                        .bucket(part_bucket)
+                        .key(part_key)
+                        .upload_id(part_upload_id)
+                        .part_number(part_id)
+                        .body(ByteStream::from(buffer))
+                        .send()
+                        .await
+                        .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                    let etag = output.e_tag().map(ToString::to_string).ok_or_else(|| {
+                        AppError::Provider("provider did not return a part ETag".to_string())
+                    })?;
+                    Ok((part_id, etag, part_bytes))
+                });
                 part_number += 1;
+                if in_flight.len() >= part_concurrency {
+                    let part = join_part(&mut in_flight).await?;
+                    record_part(&self.manager, id, &mut completed, &mut transferred, part).await?;
+                }
             }
+            while !in_flight.is_empty() {
+                let part = join_part(&mut in_flight).await?;
+                record_part(&self.manager, id, &mut completed, &mut transferred, part).await?;
+            }
+            let completed_parts = completed
+                .iter()
+                .map(|(part_number, (etag, _))| {
+                    CompletedPart::builder()
+                        .part_number(*part_number)
+                        .e_tag(etag.clone())
+                        .build()
+                })
+                .collect::<Vec<_>>();
             let multipart = CompletedMultipartUpload::builder()
-                .set_parts(Some(completed))
+                .set_parts(Some(completed_parts))
                 .build();
             client
                 .complete_multipart_upload()
@@ -507,6 +622,14 @@ impl TransferService {
                 .upload_id(&upload_id)
                 .send()
                 .await;
+            if let Err(error) = self.manager.clear_multipart_upload(id).await {
+                tracing::warn!(transfer_id = %id, error = %error, "unable to clear aborted multipart checkpoint");
+            }
+        } else if let Err(error) = self.manager.clear_multipart_upload(id).await {
+            // The provider object is already complete; retain the successful
+            // transfer result and surface the stale local checkpoint only in
+            // diagnostics so the user is not asked to upload it again.
+            tracing::warn!(transfer_id = %id, error = %error, "unable to clear completed multipart checkpoint");
         }
         result
     }
@@ -548,7 +671,9 @@ impl TransferService {
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-        let total = head.content_length().unwrap_or(0).max(0) as u64;
+        let total = head
+            .content_length()
+            .and_then(|value| u64::try_from(value).ok());
         let remote_etag = head.e_tag().map(ToString::to_string);
         let mut offset = 0_u64;
         if partial.exists() {
@@ -558,7 +683,7 @@ impl TransferService {
                     .is_some_and(|metadata| {
                         metadata.bucket == bucket
                             && metadata.key == key
-                            && metadata.total_bytes == total
+                            && total.is_some_and(|value| metadata.total_bytes == value)
                             && metadata.etag == remote_etag
                     })
             } else {
@@ -566,7 +691,7 @@ impl TransferService {
             };
             if valid_resume {
                 offset = fs::metadata(&partial).await?.len();
-                if offset >= total {
+                if total.is_some_and(|value| offset >= value) {
                     offset = 0;
                     let _ = fs::remove_file(&partial).await;
                 }
@@ -578,7 +703,7 @@ impl TransferService {
         let resume_metadata = DownloadResumeMetadata {
             bucket: bucket.clone(),
             key: key.clone(),
-            total_bytes: total,
+            total_bytes: total.unwrap_or_default(),
             etag: remote_etag,
         };
         fs::write(
@@ -588,51 +713,69 @@ impl TransferService {
             })?,
         )
         .await?;
-        let mut get_request = client.get_object().bucket(&bucket).key(&key);
-        if offset > 0 {
-            get_request = get_request.range(format!("bytes={offset}-"));
-        }
-        let output = get_request
-            .send()
-            .await
-            .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-        let response_size = output.content_length().unwrap_or(0).max(0) as u64;
-        if offset.saturating_add(response_size) != total {
-            let _ = fs::remove_file(&partial).await;
-            let _ = fs::remove_file(&partial_metadata).await;
-            return Err(AppError::Provider(
-                "download resume identity or content range did not match the remote object"
-                    .to_string(),
-            ));
-        }
         let result: Result<u64, AppError> = async {
-            let mut file = if offset > 0 {
-                fs::OpenOptions::new().append(true).open(&partial).await?
-            } else {
-                File::create(&partial).await?
-            };
-            let mut stream = output.body.into_async_read();
-            let mut buffer = vec![0_u8; 1024 * 1024];
-            let mut transferred = offset;
             loop {
                 self.manager.checkpoint(id).await?;
-                let count = stream.read(&mut buffer).await?;
-                if count == 0 {
-                    break;
+                let mut get_request = client.get_object().bucket(&bucket).key(&key);
+                if offset > 0 {
+                    get_request = get_request.range(format!("bytes={offset}-"));
                 }
-                file.write_all(&buffer[..count]).await?;
-                transferred += count as u64;
-                self.manager
-                    .update_progress(id, transferred, 0, None, None)
-                    .await?;
+                let output = get_request
+                    .send()
+                    .await
+                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                let response_size = output
+                    .content_length()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default();
+                if let Some(expected) = total {
+                    if offset.saturating_add(response_size) != expected {
+                        return Err(AppError::Provider(
+                            "download resume identity or content range did not match the remote object"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let mut file = if offset > 0 {
+                    fs::OpenOptions::new().append(true).open(&partial).await?
+                } else {
+                    File::create(&partial).await?
+                };
+                let mut stream = output.body.into_async_read();
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                let mut paused = false;
+                loop {
+                    if self.manager.checkpoint(id).await? {
+                        paused = true;
+                        break;
+                    }
+                    let count = stream.read(&mut buffer).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    file.write_all(&buffer[..count]).await?;
+                    offset = offset.saturating_add(count as u64);
+                    self.manager
+                        .update_progress(id, offset, 0, None, None)
+                        .await?;
+                }
+                file.flush().await?;
+                if paused {
+                    // The checkpoint waits for resume. Reopen the provider
+                    // response from the new local offset rather than reading
+                    // from a stale response stream.
+                    continue;
+                }
+                if let Some(expected) = total {
+                    if offset != expected {
+                        return Err(AppError::Provider(format!(
+                            "download size mismatch: expected {expected} bytes, received {offset}"
+                        )));
+                    }
+                }
+                break;
             }
-            file.flush().await?;
-            if total > 0 && transferred != total {
-                return Err(AppError::Provider(format!(
-                    "download size mismatch: expected {total} bytes, received {transferred}"
-                )));
-            }
-            Ok(transferred)
+            Ok(offset)
         }
         .await;
         match result {
@@ -652,10 +795,7 @@ impl TransferService {
                     return Err(error.into());
                 }
                 let _ = fs::remove_file(&partial_metadata).await;
-                Ok(ExecutionOutcome::completed(
-                    if total == 0 { transferred } else { total },
-                    1,
-                ))
+                Ok(ExecutionOutcome::completed(total.unwrap_or(transferred), 1))
             }
             Err(error) => {
                 if !settings.keep_partial_downloads {
@@ -675,7 +815,7 @@ impl TransferService {
         self.manager.checkpoint(id).await?;
         let (source_profile, source_bucket, source_key) =
             self.remote_target(Some(&request.source)).await?;
-        let destination = match request.destination.as_ref() {
+        let mut destination = match request.destination.as_ref() {
             Some(TransferEndpoint::Remote {
                 profile_id,
                 bucket,
@@ -706,6 +846,9 @@ impl TransferService {
             .clients
             .get_or_create(&source_profile, &credentials)
             .await?;
+        if request.collision_policy == CollisionPolicy::Rename {
+            destination.1 = unique_remote_key(&client, &destination.0, &destination.1).await?;
+        }
         if let Err(error) = ensure_collision(
             &client,
             &destination.0,
@@ -717,7 +860,7 @@ impl TransferService {
             if request.collision_policy == CollisionPolicy::Skip
                 && matches!(error, AppError::TransferStateConflict(_))
             {
-                return Ok(ExecutionOutcome::completed(0, 1));
+                return Ok(ExecutionOutcome::skipped());
             }
             return Err(error);
         }
@@ -732,8 +875,10 @@ impl TransferService {
         let source_etag = source_head.e_tag().map(ToString::to_string);
         let multipart_copy = source_size > SINGLE_COPY_LIMIT_BYTES;
         if multipart_copy {
+            let source_profile_id = source_profile.id.to_string();
             self.copy_multipart(
                 id,
+                Some(&source_profile_id),
                 &client,
                 &source_bucket,
                 &source_key,
@@ -805,6 +950,7 @@ impl TransferService {
     async fn copy_multipart(
         &self,
         id: Uuid,
+        profile_id: Option<&str>,
         client: &aws_sdk_s3::Client,
         source_bucket: &str,
         source_key: &str,
@@ -815,12 +961,7 @@ impl TransferService {
         replace_metadata: bool,
         replacement: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
-        let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
-        if part_count > 10_000 {
-            return Err(AppError::Validation(
-                "object requires too many multipart copy parts".to_string(),
-            ));
-        }
+        let ranges = multipart_copy_ranges(source_size)?;
         let mut create = client
             .create_multipart_upload()
             .bucket(destination_bucket)
@@ -875,43 +1016,135 @@ impl TransferService {
             .upload_id()
             .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
             .to_string();
+        if let Err(error) = self
+            .manager
+            .persist_multipart_upload(
+                id,
+                profile_id,
+                destination_bucket,
+                destination_key,
+                &upload_id,
+                MULTIPART_COPY_PART_BYTES,
+            )
+            .await
+        {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(error);
+        }
         let source = encode_copy_source(source_bucket, source_key);
+        let part_concurrency = usize::from(
+            self.settings
+                .get()
+                .await
+                .per_job_part_concurrency
+                .clamp(1, 16),
+        );
+        let permits = Arc::new(Semaphore::new(part_concurrency));
         let result = async {
-            let mut parts = Vec::with_capacity(part_count as usize);
-            let mut start = 0_u64;
-            let mut part_number = 1_i32;
-            while start < source_size {
+            let mut in_flight = JoinSet::new();
+            let mut parts = BTreeMap::<i32, (String, u64)>::new();
+            let mut transferred = 0_u64;
+            for (part_number, start, end) in ranges {
                 self.manager.checkpoint(id).await?;
-                let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
-                let output = client
-                    .upload_part_copy()
-                    .bucket(destination_bucket)
-                    .key(destination_key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .copy_source(&source)
-                    .copy_source_range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-                let etag = output
-                    .copy_part_result()
-                    .and_then(|result| result.e_tag())
-                    .ok_or_else(|| {
-                        AppError::Provider("provider did not return a copy part ETag".to_string())
+                let bytes = end.saturating_sub(start).saturating_add(1);
+                let permit = permits.clone().acquire_owned().await.map_err(|_| {
+                    AppError::TransferStateConflict(
+                        "multipart copy scheduler is unavailable".to_string(),
+                    )
+                })?;
+                let copy_client = client.clone();
+                let copy_bucket = destination_bucket.to_string();
+                let copy_key = destination_key.to_string();
+                let copy_upload_id = upload_id.clone();
+                let copy_source = source.clone();
+                let copy_range = format!("bytes={start}-{end}");
+                let copy_part_number = part_number;
+                in_flight.spawn(async move {
+                    let _permit = permit;
+                    let output = copy_client
+                        .upload_part_copy()
+                        .bucket(copy_bucket)
+                        .key(copy_key)
+                        .upload_id(copy_upload_id)
+                        .part_number(copy_part_number)
+                        .copy_source(copy_source)
+                        .copy_source_range(copy_range)
+                        .send()
+                        .await
+                        .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                    let etag = output
+                        .copy_part_result()
+                        .and_then(|result| result.e_tag())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            AppError::Provider(
+                                "provider did not return a copy part ETag".to_string(),
+                            )
+                        })?;
+                    Ok::<(i32, String, u64), AppError>((copy_part_number, etag, bytes))
+                });
+                if in_flight.len() >= part_concurrency {
+                    let joined = in_flight.join_next().await.ok_or_else(|| {
+                        AppError::Unknown("multipart copy queue ended early".to_string())
                     })?;
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number(part_number)
-                        .e_tag(etag)
-                        .build(),
-                );
-                self.manager
-                    .update_progress(id, end + 1, 0, None, None)
-                    .await?;
-                start = end + 1;
-                part_number += 1;
+                    let (part, etag, size_bytes) = joined.map_err(|error| {
+                        AppError::Unknown(format!("multipart copy task failed: {error}"))
+                    })??;
+                    self.manager
+                        .persist_multipart_part(
+                            id,
+                            u32::try_from(part).map_err(|_| {
+                                AppError::Unknown("multipart part number overflow".to_string())
+                            })?,
+                            &etag,
+                            size_bytes,
+                        )
+                        .await?;
+                    parts.insert(part, (etag, size_bytes));
+                    transferred = transferred.saturating_add(size_bytes);
+                    self.manager
+                        .update_progress(id, transferred, 0, None, None)
+                        .await?;
+                }
             }
+            while !in_flight.is_empty() {
+                let joined = in_flight.join_next().await.ok_or_else(|| {
+                    AppError::Unknown("multipart copy queue ended early".to_string())
+                })?;
+                let (part, etag, size_bytes) = joined.map_err(|error| {
+                    AppError::Unknown(format!("multipart copy task failed: {error}"))
+                })??;
+                self.manager
+                    .persist_multipart_part(
+                        id,
+                        u32::try_from(part).map_err(|_| {
+                            AppError::Unknown("multipart part number overflow".to_string())
+                        })?,
+                        &etag,
+                        size_bytes,
+                    )
+                    .await?;
+                parts.insert(part, (etag, size_bytes));
+                transferred = transferred.saturating_add(size_bytes);
+                self.manager
+                    .update_progress(id, transferred, 0, None, None)
+                    .await?;
+            }
+            let completed_parts = parts
+                .iter()
+                .map(|(part, (etag, _))| {
+                    CompletedPart::builder()
+                        .part_number(*part)
+                        .e_tag(etag.clone())
+                        .build()
+                })
+                .collect::<Vec<_>>();
             client
                 .complete_multipart_upload()
                 .bucket(destination_bucket)
@@ -919,7 +1152,7 @@ impl TransferService {
                 .upload_id(&upload_id)
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
+                        .set_parts(Some(completed_parts))
                         .build(),
                 )
                 .send()
@@ -936,6 +1169,11 @@ impl TransferService {
                 .upload_id(&upload_id)
                 .send()
                 .await;
+            if let Err(error) = self.manager.clear_multipart_upload(id).await {
+                tracing::warn!(transfer_id = %id, error = %error, "unable to clear aborted multipart copy checkpoint");
+            }
+        } else if let Err(error) = self.manager.clear_multipart_upload(id).await {
+            tracing::warn!(transfer_id = %id, error = %error, "unable to clear completed multipart copy checkpoint");
         }
         result
     }
@@ -946,6 +1184,9 @@ impl TransferService {
         request: &StartTransferRequest,
     ) -> Result<ExecutionOutcome, AppError> {
         let result = self.copy_object(id, request).await?;
+        if result.skipped {
+            return Ok(result);
+        }
         let (_, bucket, key) = self.remote_target(Some(&request.source)).await?;
         let credentials = resolve_profile_credentials(
             self.credentials.as_ref(),
@@ -1166,6 +1407,7 @@ impl TransferService {
             failed_items,
             cleanup_required_items: 0,
             status: TransferStatus::CompletedWithWarnings,
+            skipped: false,
         })
     }
 
@@ -1200,6 +1442,7 @@ impl TransferService {
             client,
             manager: self.manager.clone(),
             transfer_id: id,
+            profile_id: Some(profile.id.to_string()),
             operation: TransferOperation::UploadDirectory,
             settings: settings.clone(),
             metadata: request.metadata.clone(),
@@ -1244,6 +1487,7 @@ impl TransferService {
             client,
             manager: self.manager.clone(),
             transfer_id: id,
+            profile_id: Some(profile.id.to_string()),
             operation: TransferOperation::DownloadPrefix,
             settings: settings.clone(),
             metadata: None,
@@ -1325,6 +1569,7 @@ impl TransferService {
             client,
             manager: self.manager.clone(),
             transfer_id: id,
+            profile_id: Some(source_profile.id.to_string()),
             operation,
             settings: settings.clone(),
             metadata: request.metadata.clone(),
@@ -1380,6 +1625,18 @@ impl TransferService {
         plan: RecursivePlan,
         executor: E,
     ) -> Result<ExecutionOutcome, AppError> {
+        let item_snapshots = plan
+            .items
+            .iter()
+            .map(recursive_item_snapshot)
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .manager
+            .replace_transfer_items(id, &item_snapshots)
+            .await
+        {
+            tracing::warn!(transfer_id = %id, error = %error, "unable to persist recursive transfer plan");
+        }
         let cancellation = CancellationFlag::default();
         let monitor_cancellation = cancellation.clone();
         let monitor_manager = self.manager.clone();
@@ -1411,12 +1668,47 @@ impl TransferService {
         let result = execute_recursive(&plan, &executor, &cancellation, Some(sender)).await;
         cancellation_monitor.abort();
         let _ = progress_task.await;
+        for item in &plan.items {
+            let failure = result
+                .failures
+                .iter()
+                .find(|failure| failure.item_id == item.id);
+            let (status, bytes, error, cleanup_required) = match failure {
+                Some(failure) => (
+                    if failure.cleanup_required {
+                        TransferStatus::CompletedWithWarnings
+                    } else {
+                        TransferStatus::Failed
+                    },
+                    0,
+                    Some(&failure.error),
+                    failure.cleanup_required,
+                ),
+                None if item.collision == crate::transfer::recursive::CollisionResolution::Skip => {
+                    (TransferStatus::Completed, 0, None, false)
+                }
+                None => (
+                    TransferStatus::Completed,
+                    item.size_bytes.unwrap_or_default(),
+                    None,
+                    false,
+                ),
+            };
+            if let Err(persist_error) = self
+                .manager
+                .update_transfer_item(id, &item.id, status, bytes, error, cleanup_required)
+                .await
+            {
+                tracing::warn!(transfer_id = %id, item_id = %item.id, error = %persist_error, "unable to persist recursive transfer item result");
+            }
+        }
         Ok(ExecutionOutcome {
             transferred_bytes: result.transferred_bytes,
             completed_items: result.completed_items,
             failed_items: result.failed_items,
             cleanup_required_items: result.cleanup_required_items,
             status: result.status,
+            skipped: false,
         })
     }
 
@@ -1441,10 +1733,38 @@ impl TransferService {
     }
 }
 
+fn recursive_item_snapshot(item: &RecursiveItem) -> TransferItem {
+    let source_key = match &item.source {
+        TransferEndpoint::Remote { key, .. } => Some(key.clone()),
+        TransferEndpoint::Local { path } => Some(path.clone()),
+    };
+    let destination_key = match &item.destination {
+        TransferEndpoint::Remote { key, .. } => Some(key.clone()),
+        TransferEndpoint::Local { .. } => None,
+    };
+    let local_path = match (&item.source, &item.destination) {
+        (TransferEndpoint::Local { path }, _) => Some(path.clone()),
+        (_, TransferEndpoint::Local { path }) => Some(path.clone()),
+        _ => None,
+    };
+    TransferItem {
+        schema_version: crate::dto::transfer::DTO_SCHEMA_VERSION,
+        id: item.id.clone(),
+        source_key,
+        destination_key,
+        local_path,
+        size_bytes: item.size_bytes,
+        status: TransferStatus::Queued,
+        retry_count: 0,
+        error: None,
+    }
+}
+
 struct S3RecursiveExecutor {
     client: Arc<aws_sdk_s3::Client>,
     manager: Arc<TransferManager>,
     transfer_id: Uuid,
+    profile_id: Option<String>,
     operation: TransferOperation,
     settings: SettingsSnapshot,
     metadata: Option<UploadMetadata>,
@@ -1509,7 +1829,12 @@ impl S3RecursiveExecutor {
                 "recursive upload source must be local".to_string(),
             ));
         };
-        let TransferEndpoint::Remote { bucket, key, .. } = &item.destination else {
+        let TransferEndpoint::Remote {
+            profile_id,
+            bucket,
+            key,
+        } = &item.destination
+        else {
             return Err(AppError::Validation(
                 "recursive upload destination must be remote".to_string(),
             ));
@@ -1535,7 +1860,7 @@ impl S3RecursiveExecutor {
         let size = metadata.len();
         let modified = metadata.modified().ok();
         if size >= self.settings.multipart_threshold_bytes {
-            self.upload_multipart_item(path, bucket, key, size, self.metadata.as_ref())
+            self.upload_multipart_item(profile_id, path, bucket, key, size, self.metadata.as_ref())
                 .await?;
             verify_local_upload_snapshot(Path::new(path), size, modified).await?;
             return Ok(size);
@@ -1574,6 +1899,7 @@ impl S3RecursiveExecutor {
 
     async fn upload_multipart_item(
         &self,
+        profile_id: &str,
         path: &str,
         bucket: &str,
         key: &str,
@@ -1617,6 +1943,28 @@ impl S3RecursiveExecutor {
             .upload_id()
             .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
             .to_string();
+        if let Err(error) = self
+            .manager
+            .persist_multipart_upload(
+                self.transfer_id,
+                Some(profile_id),
+                bucket,
+                key,
+                &upload_id,
+                part_size,
+            )
+            .await
+        {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(error);
+        }
         let result = async {
             let mut file = File::open(path).await?;
             let mut parts = Vec::new();
@@ -1650,6 +1998,16 @@ impl S3RecursiveExecutor {
                 let etag = output.e_tag().ok_or_else(|| {
                     AppError::Provider("provider did not return a part ETag".to_string())
                 })?;
+                self.manager
+                    .persist_multipart_part(
+                        self.transfer_id,
+                        u32::try_from(part_number).map_err(|_| {
+                            AppError::Unknown("multipart part number overflow".to_string())
+                        })?,
+                        etag,
+                        read as u64,
+                    )
+                    .await?;
                 parts.push(
                     CompletedPart::builder()
                         .part_number(part_number)
@@ -1683,6 +2041,11 @@ impl S3RecursiveExecutor {
                 .upload_id(&upload_id)
                 .send()
                 .await;
+            if let Err(error) = self.manager.clear_multipart_upload(self.transfer_id).await {
+                tracing::warn!(transfer_id = %self.transfer_id, error = %error, "unable to clear aborted recursive multipart checkpoint");
+            }
+        } else if let Err(error) = self.manager.clear_multipart_upload(self.transfer_id).await {
+            tracing::warn!(transfer_id = %self.transfer_id, error = %error, "unable to clear completed recursive multipart checkpoint");
         }
         result
     }
@@ -1869,12 +2232,7 @@ impl S3RecursiveExecutor {
         replace_metadata: bool,
         replacement: Option<&UploadMetadata>,
     ) -> Result<(), AppError> {
-        let part_count = source_size.div_ceil(MULTIPART_COPY_PART_BYTES);
-        if part_count > 10_000 {
-            return Err(AppError::Validation(
-                "object requires too many multipart copy parts".to_string(),
-            ));
-        }
+        let ranges = multipart_copy_ranges(source_size)?;
         let mut create = self
             .client
             .create_multipart_upload()
@@ -1930,40 +2288,118 @@ impl S3RecursiveExecutor {
             .upload_id()
             .ok_or_else(|| AppError::Provider("provider did not return an upload ID".to_string()))?
             .to_string();
+        if let Err(error) = self
+            .manager
+            .persist_multipart_upload(
+                self.transfer_id,
+                self.profile_id.as_deref(),
+                destination_bucket,
+                destination_key,
+                &upload_id,
+                MULTIPART_COPY_PART_BYTES,
+            )
+            .await
+        {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(destination_bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(error);
+        }
         let source = encode_copy_source(source_bucket, source_key);
         let result = async {
-            let mut parts = Vec::with_capacity(part_count as usize);
-            let mut start = 0_u64;
-            let mut part_number = 1_i32;
-            while start < source_size {
+            let part_concurrency = usize::from(self.settings.per_job_part_concurrency.clamp(1, 16));
+            let permits = Arc::new(Semaphore::new(part_concurrency));
+            let mut in_flight = JoinSet::new();
+            let mut parts = BTreeMap::<i32, (String, u64)>::new();
+            let mut transferred = 0_u64;
+            for (part_number, start, end) in ranges {
                 self.manager.checkpoint(self.transfer_id).await?;
-                let end = (start + MULTIPART_COPY_PART_BYTES - 1).min(source_size - 1);
-                let output = self
-                    .client
-                    .upload_part_copy()
-                    .bucket(destination_bucket)
-                    .key(destination_key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .copy_source(&source)
-                    .copy_source_range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
-                let etag = output
-                    .copy_part_result()
-                    .and_then(|result| result.e_tag())
-                    .ok_or_else(|| {
-                        AppError::Provider("provider did not return a copy part ETag".to_string())
-                    })?;
-                parts.push(
-                    CompletedPart::builder()
+                let bytes = end.saturating_sub(start).saturating_add(1);
+                let permit = permits.clone().acquire_owned().await.map_err(|_| {
+                    AppError::TransferStateConflict(
+                        "multipart copy scheduler is unavailable".to_string(),
+                    )
+                })?;
+                let copy_client = self.client.clone();
+                let copy_bucket = destination_bucket.to_string();
+                let copy_key = destination_key.to_string();
+                let copy_upload_id = upload_id.clone();
+                let copy_source = source.clone();
+                in_flight.spawn(async move {
+                    let _permit = permit;
+                    let output = copy_client
+                        .upload_part_copy()
+                        .bucket(copy_bucket)
+                        .key(copy_key)
+                        .upload_id(copy_upload_id)
                         .part_number(part_number)
-                        .e_tag(etag)
-                        .build(),
-                );
-                start = end + 1;
-                part_number += 1;
+                        .copy_source(copy_source)
+                        .copy_source_range(format!("bytes={start}-{end}"))
+                        .send()
+                        .await
+                        .map_err(|error| AppError::Provider(safe_provider_error(&error)))?;
+                    let etag = output
+                        .copy_part_result()
+                        .and_then(|result| result.e_tag())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            AppError::Provider(
+                                "provider did not return a copy part ETag".to_string(),
+                            )
+                        })?;
+                    Ok::<(i32, String, u64), AppError>((part_number, etag, bytes))
+                });
+                if in_flight.len() >= part_concurrency {
+                    let joined = in_flight.join_next().await.ok_or_else(|| {
+                        AppError::Unknown("multipart copy queue ended early".to_string())
+                    })?;
+                    let (part, etag, size_bytes) = joined.map_err(|error| {
+                        AppError::Unknown(format!("multipart copy task failed: {error}"))
+                    })??;
+                    self.manager
+                        .persist_multipart_part(
+                            self.transfer_id,
+                            u32::try_from(part).map_err(|_| {
+                                AppError::Unknown("multipart part number overflow".to_string())
+                            })?,
+                            &etag,
+                            size_bytes,
+                        )
+                        .await?;
+                    parts.insert(part, (etag, size_bytes));
+                    transferred = transferred.saturating_add(size_bytes);
+                    self.manager
+                        .update_progress(self.transfer_id, transferred, 0, None, None)
+                        .await?;
+                }
+            }
+            while !in_flight.is_empty() {
+                let joined = in_flight.join_next().await.ok_or_else(|| {
+                    AppError::Unknown("multipart copy queue ended early".to_string())
+                })?;
+                let (part, etag, size_bytes) = joined.map_err(|error| {
+                    AppError::Unknown(format!("multipart copy task failed: {error}"))
+                })??;
+                self.manager
+                    .persist_multipart_part(
+                        self.transfer_id,
+                        u32::try_from(part).map_err(|_| {
+                            AppError::Unknown("multipart part number overflow".to_string())
+                        })?,
+                        &etag,
+                        size_bytes,
+                    )
+                    .await?;
+                parts.insert(part, (etag, size_bytes));
+                transferred = transferred.saturating_add(size_bytes);
+                self.manager
+                    .update_progress(self.transfer_id, transferred, 0, None, None)
+                    .await?;
             }
             self.client
                 .complete_multipart_upload()
@@ -1972,7 +2408,17 @@ impl S3RecursiveExecutor {
                 .upload_id(&upload_id)
                 .multipart_upload(
                     CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
+                        .set_parts(Some(
+                            parts
+                                .iter()
+                                .map(|(part, (etag, _))| {
+                                    CompletedPart::builder()
+                                        .part_number(*part)
+                                        .e_tag(etag.clone())
+                                        .build()
+                                })
+                                .collect(),
+                        ))
                         .build(),
                 )
                 .send()
@@ -1990,6 +2436,11 @@ impl S3RecursiveExecutor {
                 .upload_id(&upload_id)
                 .send()
                 .await;
+            if let Err(error) = self.manager.clear_multipart_upload(self.transfer_id).await {
+                tracing::warn!(transfer_id = %self.transfer_id, error = %error, "unable to clear aborted recursive multipart copy checkpoint");
+            }
+        } else if let Err(error) = self.manager.clear_multipart_upload(self.transfer_id).await {
+            tracing::warn!(transfer_id = %self.transfer_id, error = %error, "unable to clear completed recursive multipart copy checkpoint");
         }
         result
     }
@@ -2011,6 +2462,7 @@ fn authorize_request(request: &StartTransferRequest) -> Result<(), AppError> {
             TransferEndpoint::Local { path } => {
                 if path.is_empty()
                     || path.contains('\0')
+                    || !is_absolute_local_path(path)
                     || path.split(['/', '\\']).any(|part| part == "..")
                 {
                     return Err(AppError::Validation("local path is unsafe".to_string()));
@@ -2075,10 +2527,25 @@ fn local_path(endpoint: &TransferEndpoint) -> Result<PathBuf, AppError> {
             "local endpoint is required".to_string(),
         ));
     };
-    if path.is_empty() || path.contains('\0') || path.split(['/', '\\']).any(|part| part == "..") {
+    if path.is_empty()
+        || path.contains('\0')
+        || !is_absolute_local_path(path)
+        || path.split(['/', '\\']).any(|part| part == "..")
+    {
         return Err(AppError::Validation("local path is invalid".to_string()));
     }
     Ok(PathBuf::from(path))
+}
+
+fn is_absolute_local_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || (value.len() >= 3
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'/' | b'\\')
+            && value.as_bytes()[0].is_ascii_alphabetic())
 }
 
 async fn verify_local_upload_snapshot(
@@ -2161,6 +2628,9 @@ async fn unique_remote_key(
     bucket: &str,
     key: &str,
 ) -> Result<String, AppError> {
+    if !object_exists(client, bucket, key).await? {
+        return Ok(key.to_string());
+    }
     let (parent, filename) = key.rsplit_once('/').unwrap_or(("", key));
     let (stem, extension) = filename
         .rsplit_once('.')
@@ -2307,6 +2777,9 @@ fn user_metadata_matches(
 fn safe_provider_error(error: &impl std::fmt::Display) -> String {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
+    if is_credential_expired_message(&message) {
+        return "credential expired".to_string();
+    }
     if [
         "authorization",
         "access key",
@@ -2359,4 +2832,20 @@ fn percent_encode_path(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multipart_copy_ranges_are_bounded_and_contiguous() {
+        let part_bytes = MULTIPART_COPY_PART_BYTES;
+        let ranges = multipart_copy_ranges(part_bytes * 2 + 7).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], (1, 0, part_bytes - 1));
+        assert_eq!(ranges[1], (2, part_bytes, part_bytes * 2 - 1));
+        assert_eq!(ranges[2], (3, part_bytes * 2, part_bytes * 2 + 6));
+        assert!(multipart_copy_ranges(part_bytes * 10_001).is_err());
+    }
 }

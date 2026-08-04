@@ -124,7 +124,7 @@ impl DiagnosticsService {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
-            database_schema_version: 5,
+            database_schema_version: 6,
             providers: vec![
                 "awsS3".to_string(),
                 "cloudflareR2".to_string(),

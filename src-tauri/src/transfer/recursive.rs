@@ -197,6 +197,9 @@ pub fn plan_upload_directory_with_options(
         preserve_empty_folders,
         &mut items,
     )?;
+    if collision_policy == CollisionPolicy::Rename {
+        apply_remote_rename_collisions(&mut items, existing_destination_keys)?;
+    }
     RecursivePlan::new(TransferOperation::UploadDirectory, items)
 }
 
@@ -250,7 +253,9 @@ pub fn plan_download_prefix(
         };
         ensure_local_descendant(&root, &local)?;
         let mut destination_id = normalize_local_identity(&local);
-        if !seen_destinations.insert(destination_id.clone()) {
+        if collision_policy != CollisionPolicy::Rename
+            && !seen_destinations.insert(destination_id.clone())
+        {
             local = collision_path(&local, &object.key);
             ensure_local_descendant(&root, &local)?;
             destination_id = normalize_local_identity(&local);
@@ -282,6 +287,9 @@ pub fn plan_download_prefix(
             is_directory: is_folder_marker,
             collision: CollisionResolution::from_policy(collision_policy, exists),
         });
+    }
+    if collision_policy == CollisionPolicy::Rename {
+        apply_local_rename_collisions(&mut items, &root, existing_local_paths)?;
     }
     RecursivePlan::new(TransferOperation::DownloadPrefix, items)
 }
@@ -362,7 +370,9 @@ pub fn plan_remote_prefix(
         } else {
             join_prefix(&destination, suffix)
         };
-        if !seen_destinations.insert(destination_key.to_string()) {
+        if collision_policy != CollisionPolicy::Rename
+            && !seen_destinations.insert(destination_key.to_string())
+        {
             return Err(AppError::Validation(format!(
                 "duplicate destination key planned: {destination_key}"
             )));
@@ -386,6 +396,9 @@ pub fn plan_remote_prefix(
             is_directory: is_folder_marker,
             collision: CollisionResolution::from_policy(collision_policy, exists),
         });
+    }
+    if collision_policy == CollisionPolicy::Rename {
+        apply_remote_rename_collisions(&mut items, existing_destination_keys)?;
     }
     RecursivePlan::new(operation, items)
 }
@@ -505,6 +518,155 @@ fn local_item(
             collision_policy,
             existing_destination_keys.contains(&key),
         ),
+    }
+}
+
+const MAX_RENAME_ATTEMPTS: u32 = 1_000_000;
+
+fn apply_remote_rename_collisions(
+    items: &mut [RecursiveItem],
+    existing_destination_keys: &HashSet<String>,
+) -> Result<(), AppError> {
+    items.sort_by(|left, right| {
+        left.destination_key()
+            .cmp(&right.destination_key())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut reserved = BTreeSet::new();
+    for item in items {
+        let base_key = match &item.destination {
+            TransferEndpoint::Remote { key, .. } => key.clone(),
+            TransferEndpoint::Local { .. } => {
+                return Err(AppError::Validation(
+                    "remote rename planning requires remote destinations".to_string(),
+                ))
+            }
+        };
+        let occupied =
+            existing_destination_keys.contains(&base_key) || reserved.contains(&base_key);
+        let final_key = if occupied {
+            next_remote_rename_key(&base_key, existing_destination_keys, &reserved)?
+        } else {
+            base_key
+        };
+        if let TransferEndpoint::Remote { key, .. } = &mut item.destination {
+            *key = final_key.clone();
+        }
+        item.collision = CollisionResolution::Replace;
+        reserved.insert(final_key);
+    }
+    Ok(())
+}
+
+fn next_remote_rename_key(
+    key: &str,
+    existing_destination_keys: &HashSet<String>,
+    reserved: &BTreeSet<String>,
+) -> Result<String, AppError> {
+    let is_folder_marker = key.ends_with('/');
+    let trimmed = key.trim_end_matches('/');
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(index) => (&trimmed[..=index], &trimmed[index + 1..]),
+        None => ("", trimmed),
+    };
+    let (stem, extension) = split_rename_name(name);
+    for index in 1..=MAX_RENAME_ATTEMPTS {
+        let candidate_name = format!("{stem} ({index}){extension}");
+        let candidate = if is_folder_marker {
+            format!("{parent}{candidate_name}/")
+        } else {
+            format!("{parent}{candidate_name}")
+        };
+        if !existing_destination_keys.contains(&candidate) && !reserved.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Validation(format!(
+        "unable to allocate a collision-free remote destination for {key}"
+    )))
+}
+
+fn apply_local_rename_collisions(
+    items: &mut [RecursiveItem],
+    root: &Path,
+    existing_local_paths: &HashSet<String>,
+) -> Result<(), AppError> {
+    items.sort_by(|left, right| {
+        let left_path = match &left.destination {
+            TransferEndpoint::Local { path } => path,
+            TransferEndpoint::Remote { key, .. } => key,
+        };
+        let right_path = match &right.destination {
+            TransferEndpoint::Local { path } => path,
+            TransferEndpoint::Remote { key, .. } => key,
+        };
+        normalize_local_identity(Path::new(left_path))
+            .cmp(&normalize_local_identity(Path::new(right_path)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let existing_ids = existing_local_paths
+        .iter()
+        .map(|path| normalize_local_identity(Path::new(path)))
+        .collect::<HashSet<_>>();
+    let root_id = normalize_local_identity(root);
+    let mut reserved = BTreeSet::new();
+    for item in items {
+        let path = match &item.destination {
+            TransferEndpoint::Local { path } => PathBuf::from(path),
+            TransferEndpoint::Remote { .. } => {
+                return Err(AppError::Validation(
+                    "local rename planning requires local destinations".to_string(),
+                ))
+            }
+        };
+        let identity = normalize_local_identity(&path);
+        let is_root_marker = item.is_directory && identity == root_id;
+        let occupied = !is_root_marker
+            && (path.exists() || existing_ids.contains(&identity) || reserved.contains(&identity));
+        let final_path = if occupied {
+            next_local_rename_path(&path, &existing_ids, &reserved)?
+        } else {
+            path
+        };
+        let final_identity = normalize_local_identity(&final_path);
+        if let TransferEndpoint::Local { path } = &mut item.destination {
+            *path = final_path.to_string_lossy().into_owned();
+        }
+        item.collision = CollisionResolution::Replace;
+        reserved.insert(final_identity);
+    }
+    Ok(())
+}
+
+fn next_local_rename_path(
+    path: &Path,
+    existing_ids: &HashSet<String>,
+    reserved: &BTreeSet<String>,
+) -> Result<PathBuf, AppError> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::Validation("local destination has no file name".to_string()))?;
+    let (stem, extension) = split_rename_name(name);
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    for index in 1..=MAX_RENAME_ATTEMPTS {
+        let candidate = parent.join(format!("{stem} ({index}){extension}"));
+        let identity = normalize_local_identity(&candidate);
+        if !candidate.exists() && !existing_ids.contains(&identity) && !reserved.contains(&identity)
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Validation(format!(
+        "unable to allocate a collision-free local destination for {}",
+        path.display()
+    )))
+}
+
+fn split_rename_name(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
     }
 }
 
@@ -1216,6 +1378,101 @@ mod tests {
             TransferEndpoint::Remote { key, .. } if key == "archive/empty/"
         ));
         assert!(plan.items[0].is_directory);
+    }
+
+    #[test]
+    fn remote_rename_reserves_existing_names_and_preserves_extensions_and_markers() {
+        let objects = vec![
+            RemoteObject {
+                key: "photos/report.txt".to_string(),
+                size_bytes: Some(3),
+                is_folder_marker: false,
+            },
+            RemoteObject {
+                key: "photos/folder/".to_string(),
+                size_bytes: Some(0),
+                is_folder_marker: true,
+            },
+        ];
+        let existing = HashSet::from([
+            "archive/report.txt".to_string(),
+            "archive/report (1).txt".to_string(),
+            "archive/folder/".to_string(),
+        ]);
+        let plan = plan_remote_prefix(
+            TransferOperation::CopyPrefix,
+            "profile",
+            "bucket",
+            "photos",
+            "archive",
+            &objects,
+            CollisionPolicy::Rename,
+            &existing,
+        )
+        .unwrap();
+        let destinations = plan
+            .items
+            .iter()
+            .map(|item| match &item.destination {
+                TransferEndpoint::Remote { key, .. } => key.clone(),
+                TransferEndpoint::Local { .. } => String::new(),
+            })
+            .collect::<HashSet<_>>();
+        assert!(destinations.contains("archive/report (2).txt"));
+        assert!(destinations.contains("archive/folder (1)/"));
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| item.collision == CollisionResolution::Replace));
+    }
+
+    #[test]
+    fn local_rename_is_case_insensitive_and_reserves_names_within_plan() {
+        let root = temp_dir("download-rename");
+        let objects = [
+            RemoteObject {
+                key: "prefix/Report.txt".to_string(),
+                size_bytes: Some(1),
+                is_folder_marker: false,
+            },
+            RemoteObject {
+                key: "prefix/report.txt".to_string(),
+                size_bytes: Some(1),
+                is_folder_marker: false,
+            },
+        ];
+        let existing = HashSet::from([root.join("REPORT (1).TXT").to_string_lossy().into_owned()]);
+        let plan = plan_download_prefix(
+            "profile",
+            "bucket",
+            "prefix",
+            &root,
+            &objects,
+            CollisionPolicy::Rename,
+            &existing,
+            true,
+        )
+        .unwrap();
+        let destinations = plan
+            .items
+            .iter()
+            .map(|item| match &item.destination {
+                TransferEndpoint::Local { path } => PathBuf::from(path),
+                TransferEndpoint::Remote { .. } => PathBuf::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(destinations.len(), 2);
+        assert!(destinations
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("Report.txt")));
+        assert!(destinations.iter().any(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("report (2).txt")
+        }));
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| item.collision == CollisionResolution::Replace));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

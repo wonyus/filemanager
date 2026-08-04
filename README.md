@@ -16,7 +16,7 @@ The MVP implementation is in place for the Windows-first release:
 - Redacted diagnostics export, settings persistence, and a per-user NSIS installer are included.
 - CI checks frontend lint/test/build, Rust format/test/clippy, and Windows NSIS packaging.
 
-The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Persistent transfer resume and signed update manifests remain release-hardening work.
+The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Session pause/range resume and durable multipart checkpoints are implemented; automatic restart resume and signed update manifests remain release-hardening work.
 
 ## Development
 

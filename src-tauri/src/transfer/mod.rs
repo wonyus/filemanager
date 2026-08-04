@@ -20,8 +20,8 @@ use crate::{
     dto::transfer::{
         ClearTransferHistoryRequest, ListTransfersRequest, StartTransferRequest,
         TransferChannelMessage, TransferDetails, TransferEndpoint, TransferHistoryPage,
-        TransferJob, TransferOperation, TransferProgress, TransferResult, TransferStatus,
-        TransferSummary, UploadMetadata, DTO_SCHEMA_VERSION,
+        TransferItem, TransferJob, TransferOperation, TransferProgress, TransferResult,
+        TransferStatus, TransferSummary, UploadMetadata, DTO_SCHEMA_VERSION,
     },
     infrastructure::database::Database,
 };
@@ -113,6 +113,59 @@ impl TransferManager {
                 tracing::warn!(error = %error, "unable to prune transfer history");
             }
         }
+    }
+
+    /// Persist the provider multipart handle before any part is uploaded.
+    /// Managers without an attached database remain usable for isolated unit
+    /// tests and intentionally treat this as a no-op.
+    pub async fn persist_multipart_upload(
+        &self,
+        transfer_id: Uuid,
+        profile_id: Option<&str>,
+        bucket: &str,
+        object_key: &str,
+        upload_id: &str,
+        part_size: u64,
+    ) -> Result<(), AppError> {
+        match self.database.as_ref() {
+            Some(database) => {
+                database
+                    .create_multipart_upload(
+                        transfer_id,
+                        profile_id,
+                        bucket,
+                        object_key,
+                        upload_id,
+                        part_size,
+                    )
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn persist_multipart_part(
+        &self,
+        transfer_id: Uuid,
+        part_number: u32,
+        etag: &str,
+        size_bytes: u64,
+    ) -> Result<(), AppError> {
+        match self.database.as_ref() {
+            Some(database) => {
+                database
+                    .record_multipart_part(transfer_id, part_number, etag, size_bytes)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn clear_multipart_upload(&self, transfer_id: Uuid) -> Result<(), AppError> {
+        if let Some(database) = self.database.as_ref() {
+            database.clear_multipart_upload(transfer_id).await?;
+        }
+        Ok(())
     }
 
     /// Recover durable jobs after opening the app.  Active jobs are first
@@ -347,13 +400,50 @@ impl TransferManager {
             .get(id)
             .await
             .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        let items = match self.database.as_ref() {
+            Some(database) => database.list_transfer_items(id).await?,
+            None => Vec::new(),
+        };
         Ok(TransferDetails {
             schema_version: DTO_SCHEMA_VERSION,
             job,
-            // Item persistence is layered on top of this session manager.  An
-            // empty list is explicit and does not fabricate provider details.
-            items: Vec::new(),
+            items,
         })
+    }
+
+    pub async fn replace_transfer_items(
+        &self,
+        transfer_id: Uuid,
+        items: &[TransferItem],
+    ) -> Result<(), AppError> {
+        if let Some(database) = self.database.as_ref() {
+            database.replace_transfer_items(transfer_id, items).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_transfer_item(
+        &self,
+        transfer_id: Uuid,
+        item_id: &str,
+        status: TransferStatus,
+        bytes_completed: u64,
+        error: Option<&PublicError>,
+        cleanup_required: bool,
+    ) -> Result<(), AppError> {
+        if let Some(database) = self.database.as_ref() {
+            database
+                .update_transfer_item(
+                    transfer_id,
+                    item_id,
+                    status,
+                    bytes_completed,
+                    error,
+                    cleanup_required,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn clear_history(
@@ -755,10 +845,10 @@ impl TransferManager {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
-            if runtime.cancel_requested || runtime.job.status == TransferStatus::Paused {
+            if runtime.cancel_requested {
                 return Ok(());
             }
-            if !runtime.pause_requested {
+            if !runtime.pause_requested && runtime.job.status != TransferStatus::Paused {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -768,17 +858,24 @@ impl TransferManager {
     /// Reach a cooperative pause boundary before starting another item or
     /// provider request. The worker acknowledges `Pausing` as `Paused`, then
     /// waits until the command transitions it back to `Running`.
-    pub async fn checkpoint(&self, id: Uuid) -> Result<(), AppError> {
+    /// Return whether this checkpoint crossed a pause boundary. Callers that
+    /// stream a resumable response can use that signal to reopen the request
+    /// with a validated Range after the user resumes.
+    pub async fn checkpoint(&self, id: Uuid) -> Result<bool, AppError> {
         if self.is_cancel_requested(id).await {
             return Err(AppError::TransferStateConflict(
                 "transfer cancelled".to_string(),
             ));
         }
-        if self
+        let current = self
             .get(id)
             .await
-            .is_some_and(|job| job.status == TransferStatus::Pausing)
-        {
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        let paused = matches!(
+            current.status,
+            TransferStatus::Pausing | TransferStatus::Paused
+        );
+        if current.status == TransferStatus::Pausing {
             self.transition(id, TransferStatus::Paused).await?;
         }
         self.wait_for_pause(id).await?;
@@ -787,7 +884,7 @@ impl TransferManager {
                 "transfer cancelled".to_string(),
             ));
         }
-        Ok(())
+        Ok(paused)
     }
 }
 
@@ -964,7 +1061,9 @@ fn validate_upload_metadata(metadata: &UploadMetadata) -> Result<(), AppError> {
 
 fn validate_local_endpoint(endpoint: &TransferEndpoint, field: &str) -> Result<(), AppError> {
     match endpoint {
-        TransferEndpoint::Local { path } if !path.trim().is_empty() && !path.contains('\0') => {
+        TransferEndpoint::Local { path }
+            if !path.trim().is_empty() && !path.contains('\0') && is_absolute_local_path(path) =>
+        {
             Ok(())
         }
         TransferEndpoint::Local { .. } => Err(AppError::Validation(format!(
@@ -974,6 +1073,17 @@ fn validate_local_endpoint(endpoint: &TransferEndpoint, field: &str) -> Result<(
             Err(AppError::Validation(format!("{field} must be local")))
         }
     }
+}
+
+fn is_absolute_local_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    path.is_absolute()
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || (value.len() >= 3
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'/' | b'\\')
+            && value.as_bytes()[0].is_ascii_alphabetic())
 }
 
 fn validate_remote_endpoint(
@@ -1059,6 +1169,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.total, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_waits_for_resume_and_reports_pause_boundary() {
+        use tokio::time::{sleep, timeout, Duration};
+
+        let manager = TransferManager::new(1);
+        let mut request = request();
+        request.operation = TransferOperation::DownloadFile;
+        request.source = TransferEndpoint::Remote {
+            profile_id: "profile-1".to_string(),
+            bucket: "bucket".to_string(),
+            key: "file.txt".to_string(),
+        };
+        request.destination = Some(TransferEndpoint::Local {
+            path: "C:/tmp/file.txt".to_string(),
+        });
+        let job = manager.create(request).await.unwrap();
+        let permit = manager.acquire_next().await.unwrap();
+        manager
+            .transition(job.id, TransferStatus::Running)
+            .await
+            .unwrap();
+        manager.request_pause(job.id).await.unwrap();
+        let waiting = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.checkpoint(job.id).await.unwrap() })
+        };
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .get(job.id)
+                    .await
+                    .is_some_and(|value| value.status == TransferStatus::Paused)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.request_resume(job.id).await.unwrap();
+        assert!(timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap());
+        drop(permit);
     }
 
     #[tokio::test]

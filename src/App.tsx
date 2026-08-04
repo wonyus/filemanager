@@ -28,6 +28,7 @@ import type {
   ShareLink,
   SettingsSnapshot,
   StartTransferRequest,
+  TransferDetails,
   TransferEndpoint,
   TransferHistoryPage,
   TransferJob,
@@ -145,6 +146,10 @@ function downloadJson(filename: string, value: unknown) {
   anchor.download = filename;
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+function hasNativeTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 interface SavedLocation extends ExplorerLocation {
@@ -328,10 +333,16 @@ function App() {
     if (profiles.length === 0) return;
     setProfileNotice(null);
     try {
-      const destinationPath = window.prompt(
-        "Export path (leave blank to download in the browser):",
-        "s3-file-manager-profiles.json",
-      );
+      const destinationPath = hasNativeTauriRuntime()
+        ? await commands.pickSaveFile("s3-file-manager-profiles.json")
+        : window.prompt(
+            "Export path (leave blank to download in the browser):",
+            "s3-file-manager-profiles.json",
+          );
+      if (hasNativeTauriRuntime() && !destinationPath) {
+        setProfileNotice("Profile export cancelled.");
+        return;
+      }
       if (destinationPath?.trim()) {
         const result = await commands.exportProfiles(
           profiles.map((profile) => profile.id),
@@ -2026,6 +2037,7 @@ function ObjectInspector({
     ["Checksum CRC32", metadata.checksumCrc32],
     ["Checksum CRC32C", metadata.checksumCrc32c],
   ];
+  const shareSupported = metadata.shareSupported !== false;
   return (
     <section className="rounded-3xl border border-border bg-panel p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
@@ -2063,13 +2075,20 @@ function ObjectInspector({
               className="rounded-xl bg-accent px-3 py-2 text-xs font-semibold text-accent-foreground hover:brightness-95 disabled:opacity-50"
               type="button"
               onClick={() => onShare(Number(shareExpiry))}
-              disabled={loading}
+              disabled={loading || !shareSupported}
+              title={metadata.shareReason}
             >
               Create share link
             </button>
           </div>
         </div>
       </div>
+      {!shareSupported && (
+        <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          {metadata.shareReason ??
+            "Temporary share links are unavailable for this provider."}
+        </p>
+      )}
       <div className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
         {rows.map(([label, value]) => (
           <div
@@ -2281,6 +2300,9 @@ function TransfersPanel({
   const [userMetadataJson, setUserMetadataJson] = useState("");
   const [preserveRoot, setPreserveRoot] = useState(true);
   const [formError, setFormError] = useState("");
+  const [destinationByJob, setDestinationByJob] = useState<
+    Record<string, string>
+  >({});
 
   useEffect(() => {
     if (defaultBucket && !bucket) setBucket(defaultBucket);
@@ -2291,6 +2313,31 @@ function TransfersPanel({
   const isDownload =
     operation === "downloadFile" || operation === "downloadPrefix";
   const isDelete = operation === "deleteObjects";
+
+  const pickLocalSource = async () => {
+    try {
+      const path = isUpload
+        ? operation === "uploadFile"
+          ? await commands.pickFile()
+          : await commands.pickDirectory()
+        : null;
+      if (path) setLocalPath(path);
+    } catch (error) {
+      setFormError(formatCommandError(error));
+    }
+  };
+
+  const pickLocalDestination = async () => {
+    try {
+      const path =
+        operation === "downloadFile"
+          ? await commands.pickSaveFile("downloaded-file")
+          : await commands.pickDirectory();
+      if (path) setLocalPath(path);
+    } catch (error) {
+      setFormError(formatCommandError(error));
+    }
+  };
 
   const start = async () => {
     setFormError("");
@@ -2381,7 +2428,7 @@ function TransfersPanel({
       source = remote(sourceKey);
       destination = isDelete ? undefined : remote(destinationKey);
     }
-    await onStart({
+    const request: StartTransferRequest = {
       schemaVersion: 1,
       operation,
       profileId,
@@ -2392,7 +2439,14 @@ function TransfersPanel({
       recursive: isDelete && sourceKey.trim().endsWith("/"),
       preserveRoot: operation === "uploadDirectory" && preserveRoot,
       metadata,
-    });
+    };
+    const job = await onStart(request);
+    if (job && destination?.kind === "local") {
+      setDestinationByJob((current) => ({
+        ...current,
+        [job.id]: destination.path,
+      }));
+    }
   };
 
   return (
@@ -2457,7 +2511,18 @@ function TransfersPanel({
           />
         </label>
         <label className="text-xs font-medium">
-          {isUpload ? "Local source path" : "Source key"}
+          <span className="flex items-center justify-between gap-2">
+            {isUpload ? "Local source path" : "Source key"}
+            {isUpload && (
+              <button
+                className="rounded-lg border border-border px-2 py-1 text-[11px]"
+                type="button"
+                onClick={() => void pickLocalSource()}
+              >
+                Browse…
+              </button>
+            )}
+          </span>
           <input
             className="input mt-1"
             value={isUpload ? localPath : sourceKey}
@@ -2471,7 +2536,18 @@ function TransfersPanel({
         </label>
         {!isDelete && (
           <label className="text-xs font-medium">
-            {isDownload ? "Local destination path" : "Destination key"}
+            <span className="flex items-center justify-between gap-2">
+              {isDownload ? "Local destination path" : "Destination key"}
+              {isDownload && (
+                <button
+                  className="rounded-lg border border-border px-2 py-1 text-[11px]"
+                  type="button"
+                  onClick={() => void pickLocalDestination()}
+                >
+                  Browse…
+                </button>
+              )}
+            </span>
             <input
               className="input mt-1"
               value={isDownload ? localPath : destinationKey}
@@ -2555,7 +2631,6 @@ function TransfersPanel({
             <option value="skip">Skip</option>
             <option value="fail">Fail</option>
             <option value="rename">Rename automatically</option>
-            <option value="rename">Rename automatically</option>
           </select>
         </label>
         <div className="flex items-end">
@@ -2584,10 +2659,18 @@ function TransfersPanel({
             <TransferRow
               key={job.id}
               job={job}
+              destinationPath={destinationByJob[job.id]}
               onPause={onPause}
               onResume={onResume}
               onCancel={onCancel}
               onRetry={onRetry}
+              onOpenDestination={async (path) => {
+                try {
+                  await commands.openDestinationFolder(path);
+                } catch (error) {
+                  setFormError(formatCommandError(error));
+                }
+              }}
             />
           ))}
         </div>
@@ -2602,17 +2685,23 @@ function TransfersPanel({
 
 function TransferRow({
   job,
+  destinationPath,
   onPause,
   onResume,
   onCancel,
   onRetry,
+  onOpenDestination,
 }: {
   job: TransferHistoryPage["items"][number];
+  destinationPath?: string;
   onPause: (id: string) => Promise<void>;
   onResume: (id: string) => Promise<void>;
   onCancel: (id: string) => Promise<void>;
   onRetry: (id: string) => Promise<void>;
+  onOpenDestination: (path: string) => Promise<void>;
 }) {
+  const [details, setDetails] = useState<TransferDetails | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
   const isActive = ![
     "completed",
     "completedWithWarnings",
@@ -2627,69 +2716,128 @@ function TransferRow({
     "copyPrefix",
     "movePrefix",
   ].includes(job.operation);
+  const loadDetails = async () => {
+    setDetailsLoading(true);
+    try {
+      setDetails(await commands.getTransferDetails(job.id));
+    } catch {
+      setDetails(null);
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm">
-      <div>
-        <p className="font-medium">
-          {job.operation} · {job.status}
-        </p>
-        <p className="text-xs text-muted">
-          {formatBytes(job.transferredBytes)}
-          {job.totalBytes === undefined
-            ? ""
-            : ` / ${formatBytes(job.totalBytes)}`}
-          {job.totalItems === undefined
-            ? ""
-            : ` · ${job.completedItems}/${job.totalItems} items`}
-          {job.failedItems > 0 ? ` · ${job.failedItems} failed` : ""}
-          {job.speedBps === undefined
-            ? ""
-            : ` · ${formatBytes(job.speedBps)}/s`}
-          {job.etaSeconds === undefined
-            ? ""
-            : ` · ETA ${formatDuration(job.etaSeconds)}`}
-        </p>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {isActive && pauseSupported && job.status === "running" && (
+    <div className="px-4 py-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="font-medium">
+            {job.operation} · {job.status}
+          </p>
+          <p className="text-xs text-muted">
+            {formatBytes(job.transferredBytes)}
+            {job.totalBytes === undefined
+              ? ""
+              : ` / ${formatBytes(job.totalBytes)}`}
+            {job.totalItems === undefined
+              ? ""
+              : ` · ${job.completedItems}/${job.totalItems} items`}
+            {job.failedItems > 0 ? ` · ${job.failedItems} failed` : ""}
+            {job.speedBps === undefined
+              ? ""
+              : ` · ${formatBytes(job.speedBps)}/s`}
+            {job.etaSeconds === undefined
+              ? ""
+              : ` · ETA ${formatDuration(job.etaSeconds)}`}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
           <button
             className="rounded-lg border border-border px-2 py-1 text-xs"
             type="button"
-            onClick={() => void onPause(job.id)}
+            onClick={() => void loadDetails()}
+            disabled={detailsLoading}
           >
-            Pause
+            {detailsLoading
+              ? "Loading…"
+              : details
+                ? "Refresh details"
+                : "Details"}
           </button>
-        )}
-        {isActive &&
-          pauseSupported &&
-          (job.status === "paused" || job.status === "pausing") && (
+          {destinationPath && !isActive && (
             <button
               className="rounded-lg border border-border px-2 py-1 text-xs"
               type="button"
-              onClick={() => void onResume(job.id)}
+              onClick={() => void onOpenDestination(destinationPath)}
             >
-              Resume
+              Open folder
             </button>
           )}
-        {isActive && (
-          <button
-            className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700"
-            type="button"
-            onClick={() => void onCancel(job.id)}
-          >
-            Cancel
-          </button>
-        )}
-        {!isActive && job.status !== "completed" && (
-          <button
-            className="rounded-lg border border-border px-2 py-1 text-xs"
-            type="button"
-            onClick={() => void onRetry(job.id)}
-          >
-            Retry
-          </button>
-        )}
+          {isActive && pauseSupported && job.status === "running" && (
+            <button
+              className="rounded-lg border border-border px-2 py-1 text-xs"
+              type="button"
+              onClick={() => void onPause(job.id)}
+            >
+              Pause
+            </button>
+          )}
+          {isActive &&
+            pauseSupported &&
+            (job.status === "paused" || job.status === "pausing") && (
+              <button
+                className="rounded-lg border border-border px-2 py-1 text-xs"
+                type="button"
+                onClick={() => void onResume(job.id)}
+              >
+                Resume
+              </button>
+            )}
+          {isActive && (
+            <button
+              className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700"
+              type="button"
+              onClick={() => void onCancel(job.id)}
+            >
+              Cancel
+            </button>
+          )}
+          {!isActive && job.status !== "completed" && (
+            <button
+              className="rounded-lg border border-border px-2 py-1 text-xs"
+              type="button"
+              onClick={() => void onRetry(job.id)}
+            >
+              Retry
+            </button>
+          )}
+        </div>
       </div>
+      {details && (
+        <div className="mt-3 rounded-xl border border-border bg-canvas p-3 text-xs">
+          <p className="font-semibold">Item results · {details.items.length}</p>
+          {details.items.length === 0 ? (
+            <p className="mt-1 text-muted">
+              No item-level records for this job.
+            </p>
+          ) : (
+            <div className="mt-2 max-h-48 space-y-1 overflow-auto">
+              {details.items.map((item) => (
+                <div
+                  className="flex flex-wrap items-start justify-between gap-2 border-t border-border pt-1 first:border-0 first:pt-0"
+                  key={`${item.id}-${item.status}`}
+                >
+                  <span className="min-w-0 break-all">
+                    {item.id} · {item.status}
+                  </span>
+                  {item.error && (
+                    <span className="text-red-700">{item.error.message}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -3097,6 +3245,14 @@ function DiagnosticsPanel({ id }: { id: string }) {
       setMessage(formatCommandError(error));
     }
   };
+  const chooseDiagnosticsPath = async () => {
+    try {
+      const path = await commands.pickSaveFile("s3fm-diagnostics.zip");
+      if (path) setDestination(path);
+    } catch (error) {
+      setMessage(formatCommandError(error));
+    }
+  };
   const showLogDirectory = async () => {
     try {
       const result = await commands.openLogDirectory();
@@ -3167,6 +3323,13 @@ function DiagnosticsPanel({ id }: { id: string }) {
           onClick={() => void exportDiagnostics()}
         >
           Export redacted diagnostics
+        </button>
+        <button
+          className="rounded-xl border border-border px-3 py-2 text-xs font-semibold"
+          type="button"
+          onClick={() => void chooseDiagnosticsPath()}
+        >
+          Browse…
         </button>
       </div>
       {message && (

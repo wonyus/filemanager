@@ -21,6 +21,133 @@ import type {
   TransferJob,
 } from "../lib/types";
 
+const DEFAULT_PREVIEW_CACHE_BYTES = 512 * 1024 * 1024;
+const MAX_RENDERER_PREVIEW_CACHE_BYTES = 512 * 1024 * 1024;
+const DEFAULT_PREVIEW_CACHE_MAX_AGE_HOURS = 24;
+
+interface CachedPreview {
+  result: PreviewResult;
+  bytes: number;
+  lastAccessAt: number;
+}
+
+// Preview text is bounded at the backend (2 MiB per request). Keep a small,
+// renderer-local LRU for repeat opens, but never cache presigned URLs or binary
+// handles because those are bearer credentials with an explicit expiry.
+const previewCache = new Map<string, CachedPreview>();
+let previewCacheBytes = 0;
+
+function previewCacheKey(
+  request: PreviewRequest,
+  objectVersion: string | null,
+): string {
+  return JSON.stringify([
+    request.schemaVersion,
+    request.profileId,
+    request.bucket,
+    request.key,
+    request.maxBytes ?? null,
+    objectVersion,
+  ]);
+}
+
+function previewObjectVersion(
+  request: PreviewRequest,
+  metadata: ObjectMetadata | null,
+): string | null {
+  if (
+    !metadata ||
+    metadata.profileId !== request.profileId ||
+    metadata.bucket !== request.bucket ||
+    metadata.key !== request.key
+  ) {
+    return null;
+  }
+  return [
+    metadata.etag ?? "",
+    metadata.versionId ?? "",
+    metadata.lastModified ?? "",
+    metadata.size ?? "",
+  ].join("|");
+}
+
+function textByteLength(value: string): number {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(value).byteLength;
+  }
+  return value.length * 2;
+}
+
+function previewCachePolicy(settings: SettingsSnapshot | null) {
+  const configuredBytes =
+    settings?.previewCacheBytes ??
+    settings?.previewCacheQuotaBytes ??
+    DEFAULT_PREVIEW_CACHE_BYTES;
+  const quotaBytes = Math.min(
+    Math.max(0, configuredBytes),
+    MAX_RENDERER_PREVIEW_CACHE_BYTES,
+  );
+  const configuredAgeHours =
+    settings?.previewCacheMaxAgeHours ?? DEFAULT_PREVIEW_CACHE_MAX_AGE_HOURS;
+  const maxAgeMs = Math.max(1, configuredAgeHours) * 60 * 60 * 1_000;
+  return { quotaBytes, maxAgeMs };
+}
+
+function removeCachedPreview(key: string) {
+  const entry = previewCache.get(key);
+  if (!entry) return;
+  previewCacheBytes = Math.max(0, previewCacheBytes - entry.bytes);
+  previewCache.delete(key);
+}
+
+function prunePreviewCache(
+  settings: SettingsSnapshot | null,
+  now = Date.now(),
+) {
+  const { quotaBytes, maxAgeMs } = previewCachePolicy(settings);
+  for (const [key, entry] of previewCache) {
+    if (now - entry.lastAccessAt > maxAgeMs) removeCachedPreview(key);
+  }
+  if (previewCacheBytes <= quotaBytes) return;
+  const oldest = [...previewCache.entries()].sort(
+    (left, right) => left[1].lastAccessAt - right[1].lastAccessAt,
+  );
+  for (const [key] of oldest) {
+    if (previewCacheBytes <= quotaBytes) break;
+    removeCachedPreview(key);
+  }
+}
+
+function readCachedPreview(
+  request: PreviewRequest,
+  settings: SettingsSnapshot | null,
+  objectVersion: string | null,
+): PreviewResult | null {
+  const key = previewCacheKey(request, objectVersion);
+  prunePreviewCache(settings);
+  const entry = previewCache.get(key);
+  if (!entry) return null;
+  entry.lastAccessAt = Date.now();
+  return entry.result;
+}
+
+function writeCachedPreview(
+  request: PreviewRequest,
+  result: PreviewResult,
+  settings: SettingsSnapshot | null,
+  objectVersion: string | null,
+) {
+  if (result.previewKind !== "text" || result.url || !result.text) return;
+  const { quotaBytes } = previewCachePolicy(settings);
+  const bytes = textByteLength(result.text);
+  if (quotaBytes <= 0 || bytes > quotaBytes) return;
+  const key = previewCacheKey(request, objectVersion);
+  removeCachedPreview(key);
+  previewCache.set(key, { result, bytes, lastAccessAt: Date.now() });
+  previewCacheBytes += bytes;
+  prunePreviewCache(settings);
+}
+
 interface AppStore {
   appInfo: AppInfo | null;
   profiles: ProfileSummary[];
@@ -335,9 +462,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
       preview: null,
       inspectorGeneration,
     });
+    const objectVersion = previewObjectVersion(request, get().metadata);
+    const cached = readCachedPreview(request, get().settings, objectVersion);
+    if (cached) {
+      if (get().inspectorGeneration !== inspectorGeneration) return null;
+      set({ loading: false, preview: cached });
+      return cached;
+    }
     try {
       const preview = await commands.previewObject(request);
       if (get().inspectorGeneration !== inspectorGeneration) return null;
+      writeCachedPreview(
+        request,
+        preview,
+        get().settings,
+        previewObjectVersion(request, get().metadata),
+      );
       set({ loading: false, preview });
       return preview;
     } catch (error) {

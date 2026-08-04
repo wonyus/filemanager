@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        error::AppError,
+        error::{AppError, PublicError},
         profile::{ConnectionProfile, SecretReference},
         provider::{AddressingStyle, CredentialMode, ProviderType},
     },
@@ -21,7 +21,7 @@ use crate::{
         profile::{ConnectionState, CredentialState, ProfileSummary},
         settings::SettingsSnapshot,
         transfer::{
-            CollisionPolicy, StartTransferRequest, TransferEndpoint, TransferJob,
+            CollisionPolicy, StartTransferRequest, TransferEndpoint, TransferItem, TransferJob,
             TransferOperation, TransferStatus,
         },
     },
@@ -39,6 +39,28 @@ pub struct Database {
 pub struct PersistedTransfer {
     pub job: TransferJob,
     pub request: StartTransferRequest,
+}
+
+/// Durable provider-side multipart state.  The upload id and part ETags are
+/// safe to keep locally; credentials and presigned URLs are never included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadRecord {
+    pub transfer_id: Uuid,
+    pub profile_id: Option<String>,
+    pub bucket: String,
+    pub object_key: String,
+    pub upload_id: String,
+    pub part_size: u64,
+    pub created_at: String,
+    pub parts: Vec<MultipartPartRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPartRecord {
+    pub part_number: u32,
+    pub etag: String,
+    pub size_bytes: u64,
+    pub completed_at: String,
 }
 
 impl Database {
@@ -290,6 +312,26 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Load the last capability observation for a profile. Capability data is
+    /// deliberately optional because a newly-created profile has not been
+    /// tested yet and older databases may not contain a row.
+    pub async fn get_profile_capabilities(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<crate::dto::profile::ConnectionTestResult>, AppError> {
+        let row =
+            sqlx::query("SELECT capabilities_json FROM profile_capabilities WHERE profile_id = ?")
+                .bind(profile_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else { return Ok(None) };
+        let value: String = row.try_get("capabilities_json")?;
+        let capabilities = serde_json::from_str(&value).map_err(|error| {
+            AppError::Unknown(format!("invalid profile capability JSON: {error}"))
+        })?;
+        Ok(Some(capabilities))
     }
 
     pub async fn get_profile(&self, id: &str) -> Result<Option<ConnectionProfile>, AppError> {
@@ -797,6 +839,305 @@ impl Database {
         removed += overflow.rows_affected() as usize;
         Ok(removed)
     }
+
+    /// Persist the provider multipart upload handle before the first part is
+    /// sent. The transfer row must already exist, which is guaranteed by the
+    /// transfer manager before a worker starts.
+    pub async fn create_multipart_upload(
+        &self,
+        transfer_id: Uuid,
+        profile_id: Option<&str>,
+        bucket: &str,
+        object_key: &str,
+        upload_id: &str,
+        part_size: u64,
+    ) -> Result<(), AppError> {
+        if upload_id.trim().is_empty() || bucket.trim().is_empty() {
+            return Err(AppError::Validation(
+                "multipart upload identifiers must be non-empty".to_string(),
+            ));
+        }
+        let part_size = i64_value(part_size, "multipart part size")?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO multipart_uploads
+                (transfer_id, profile_id, bucket, object_key, upload_id,
+                 part_size, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(transfer_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                bucket = excluded.bucket,
+                object_key = excluded.object_key,
+                upload_id = excluded.upload_id,
+                part_size = excluded.part_size,
+                created_at = excluded.created_at",
+        )
+        .bind(transfer_id.to_string())
+        .bind(profile_id)
+        .bind(bucket)
+        .bind(object_key)
+        .bind(upload_id)
+        .bind(part_size)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record an uploaded part idempotently. Providers may return the same
+    /// part more than once after a retry; the latest ETag is authoritative.
+    pub async fn record_multipart_part(
+        &self,
+        transfer_id: Uuid,
+        part_number: u32,
+        etag: &str,
+        size_bytes: u64,
+    ) -> Result<(), AppError> {
+        if !(1..=10_000).contains(&part_number) || etag.trim().is_empty() {
+            return Err(AppError::Validation(
+                "multipart part number or ETag is invalid".to_string(),
+            ));
+        }
+        let size_bytes = i64_value(size_bytes, "multipart part size")?;
+        sqlx::query(
+            "INSERT INTO multipart_parts
+                (transfer_id, part_number, etag, size_bytes, completed_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(transfer_id, part_number) DO UPDATE SET
+                etag = excluded.etag,
+                size_bytes = excluded.size_bytes,
+                completed_at = excluded.completed_at",
+        )
+        .bind(transfer_id.to_string())
+        .bind(i64::from(part_number))
+        .bind(etag)
+        .bind(size_bytes)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return all saved parts in provider completion order.
+    pub async fn list_multipart_parts(
+        &self,
+        transfer_id: Uuid,
+    ) -> Result<Vec<MultipartPartRecord>, AppError> {
+        let rows = sqlx::query(
+            "SELECT part_number, etag, size_bytes, completed_at
+             FROM multipart_parts
+             WHERE transfer_id = ?
+             ORDER BY part_number ASC",
+        )
+        .bind(transfer_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let part_number = u32::try_from(row.try_get::<i64, _>("part_number")?)
+                    .map_err(|_| AppError::Unknown("invalid multipart part number".to_string()))?;
+                let size_bytes =
+                    unsigned_value(row.try_get::<i64, _>("size_bytes")?, "multipart part size")?;
+                Ok(MultipartPartRecord {
+                    part_number,
+                    etag: row.try_get("etag")?,
+                    size_bytes,
+                    completed_at: row.try_get("completed_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// List durable multipart uploads, including their completed parts. This
+    /// is intentionally a local checkpoint list; it does not claim that the
+    /// provider still retains each upload after its expiry window.
+    pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadRecord>, AppError> {
+        let rows = sqlx::query(
+            "SELECT transfer_id, profile_id, bucket, object_key, upload_id,
+                    part_size, created_at
+             FROM multipart_uploads
+             ORDER BY created_at ASC, transfer_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut uploads = Vec::with_capacity(rows.len());
+        for row in rows {
+            let transfer_id = Uuid::parse_str(row.try_get::<String, _>("transfer_id")?.as_str())
+                .map_err(|error| {
+                    AppError::Unknown(format!("invalid multipart transfer id: {error}"))
+                })?;
+            uploads.push(MultipartUploadRecord {
+                transfer_id,
+                profile_id: row.try_get("profile_id")?,
+                bucket: row.try_get("bucket")?,
+                object_key: row.try_get("object_key")?,
+                upload_id: row.try_get("upload_id")?,
+                part_size: unsigned_value(
+                    row.try_get::<i64, _>("part_size")?,
+                    "multipart part size",
+                )?,
+                created_at: row.try_get("created_at")?,
+                parts: self.list_multipart_parts(transfer_id).await?,
+            });
+        }
+        Ok(uploads)
+    }
+
+    /// Remove the provider upload checkpoint and all saved ETags. The
+    /// provider abort/complete call is owned by the transfer worker and is
+    /// deliberately performed before this local cleanup.
+    pub async fn clear_multipart_upload(&self, transfer_id: Uuid) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM multipart_uploads WHERE transfer_id = ?")
+            .bind(transfer_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Replace the durable item plan for a recursive transfer. Item records
+    /// intentionally contain only object keys/local paths and redacted public
+    /// errors; provider credentials and bearer URLs never enter this table.
+    pub async fn replace_transfer_items(
+        &self,
+        transfer_id: Uuid,
+        items: &[TransferItem],
+    ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM transfer_items WHERE transfer_id = ?")
+            .bind(transfer_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        for item in items {
+            let source_key = item.source_key.as_deref().or(item.local_path.as_deref());
+            let destination_key = item.destination_key.as_deref();
+            sqlx::query(
+                "INSERT INTO transfer_items
+                    (transfer_id, source_key, destination_key, state,
+                     bytes_total, bytes_completed, error_code, error_message,
+                     stage, size_bytes, retry_count, public_error_json,
+                     planned_destination, collision_resolution, attempt_count,
+                     last_error_code, copy_verified_at, delete_completed_at,
+                     cleanup_required, local_path)
+                 VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, NULL, ?, NULL, 0, NULL, NULL, NULL, 0, ?)",
+            )
+            .bind(transfer_id.to_string())
+            .bind(source_key)
+            .bind(destination_key)
+            .bind(item.status.as_str())
+            .bind("planned")
+            .bind(optional_i64(item.size_bytes, "transfer item size")?)
+            .bind(i64::from(item.retry_count))
+            .bind(destination_key)
+            .bind(item.local_path.as_deref())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Update one planned item after execution. Matching uses the stable
+    /// source/local identity carried by the recursive planner.
+    pub async fn update_transfer_item(
+        &self,
+        transfer_id: Uuid,
+        item_id: &str,
+        status: TransferStatus,
+        bytes_completed: u64,
+        error: Option<&PublicError>,
+        cleanup_required: bool,
+    ) -> Result<(), AppError> {
+        let error_json = error
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|value| {
+                AppError::Unknown(format!("serialize transfer item error: {value}"))
+            })?;
+        let (error_code, error_message) = error
+            .map(|value| {
+                (
+                    Some(format!("{:?}", value.code)),
+                    Some(value.message.clone()),
+                )
+            })
+            .unwrap_or((None, None));
+        sqlx::query(
+            "UPDATE transfer_items
+             SET state = ?, stage = ?, bytes_completed = ?,
+                 error_code = ?, error_message = ?, public_error_json = ?,
+                 last_error_code = ?, cleanup_required = ?,
+                 copy_verified_at = CASE WHEN ? = 'completed' THEN COALESCE(copy_verified_at, ?) ELSE copy_verified_at END
+             WHERE transfer_id = ? AND (source_key = ? OR destination_key = ?)",
+        )
+        .bind(status.as_str())
+        .bind(if cleanup_required { "cleanupRequired" } else { status.as_str() })
+        .bind(i64_value(bytes_completed, "transfer item bytes")?)
+        .bind(error_code)
+        .bind(error_message)
+        .bind(error_json)
+        .bind(error.map(|value| format!("{:?}", value.code)))
+        .bind(if cleanup_required { 1_i64 } else { 0_i64 })
+        .bind(status.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(transfer_id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load item-level transfer history for details and diagnostics views.
+    pub async fn list_transfer_items(
+        &self,
+        transfer_id: Uuid,
+    ) -> Result<Vec<TransferItem>, AppError> {
+        let rows = sqlx::query(
+            "SELECT source_key, destination_key, local_path, size_bytes,
+                    state, retry_count, public_error_json
+             FROM transfer_items
+             WHERE transfer_id = ?
+             ORDER BY id ASC",
+        )
+        .bind(transfer_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let source_key: Option<String> = row.try_get("source_key")?;
+                let destination_key: Option<String> = row.try_get("destination_key")?;
+                let local_path: Option<String> = row.try_get("local_path")?;
+                let id = source_key
+                    .clone()
+                    .or_else(|| local_path.clone())
+                    .or_else(|| destination_key.clone())
+                    .unwrap_or_else(|| "unknown-item".to_string());
+                let status =
+                    parse_transfer_status(row.try_get::<String, _>("state")?.as_str(), "queued")?;
+                let error = row
+                    .try_get::<Option<String>, _>("public_error_json")?
+                    .map(|value| {
+                        serde_json::from_str::<PublicError>(&value).map_err(|error| {
+                            AppError::Unknown(format!("invalid transfer item error JSON: {error}"))
+                        })
+                    })
+                    .transpose()?;
+                Ok(TransferItem {
+                    schema_version: crate::dto::transfer::DTO_SCHEMA_VERSION,
+                    id,
+                    source_key,
+                    destination_key,
+                    local_path,
+                    size_bytes: unsigned_option(row.try_get("size_bytes")?, "transfer item size")?,
+                    status,
+                    retry_count: u32::try_from(row.try_get::<i64, _>("retry_count")?).map_err(
+                        |_| AppError::Unknown("invalid transfer item retry count".to_string()),
+                    )?,
+                    error,
+                })
+            })
+            .collect()
+    }
 }
 
 fn i64_value(value: u64, label: &str) -> Result<i64, AppError> {
@@ -1169,4 +1510,70 @@ fn redacted_endpoint_display(value: Option<String>) -> Option<String> {
         .map(|port| format!("{host}:{port}"))
         .unwrap_or_else(|| host.to_string());
     Some(format!("{}://{}", parsed.scheme(), authority))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn multipart_checkpoint_round_trips_and_clears() {
+        let path = std::env::temp_dir().join(format!(
+            "s3-file-manager-multipart-checkpoint-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let database = Database::connect(&path).await.unwrap();
+        let transfer_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO transfers (id, profile_id, operation, state, created_at, updated_at)
+             VALUES (?, NULL, 'uploadFile', 'queued', ?, ?)",
+        )
+        .bind(transfer_id.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        database
+            .create_multipart_upload(
+                transfer_id,
+                None,
+                "bucket",
+                "folder/object.bin",
+                "upload-123",
+                8 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+        database
+            .record_multipart_part(transfer_id, 1, "etag-1", 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        database
+            .record_multipart_part(transfer_id, 2, "etag-2", 42)
+            .await
+            .unwrap();
+        // Replaying a part update is idempotent and replaces the provider ETag.
+        database
+            .record_multipart_part(transfer_id, 2, "etag-2-retry", 43)
+            .await
+            .unwrap();
+
+        let uploads = database.list_multipart_uploads().await.unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].transfer_id, transfer_id);
+        assert_eq!(uploads[0].upload_id, "upload-123");
+        assert_eq!(uploads[0].parts.len(), 2);
+        assert_eq!(uploads[0].parts[1].etag, "etag-2-retry");
+        assert_eq!(uploads[0].parts[1].size_bytes, 43);
+
+        assert!(database.clear_multipart_upload(transfer_id).await.unwrap());
+        assert!(database.list_multipart_uploads().await.unwrap().is_empty());
+        assert!(!database.clear_multipart_upload(transfer_id).await.unwrap());
+
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
 }

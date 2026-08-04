@@ -97,6 +97,11 @@ pub struct ObjectMetadata {
     pub preview_supported: bool,
     pub preview_kind: Option<PreviewKind>,
     pub preview_reason: Option<String>,
+    /// Whether a temporary presigned GET can be created for this profile.
+    /// Unknown/custom providers stay disabled until a capability observation
+    /// explicitly confirms support.
+    pub share_supported: bool,
+    pub share_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        error::AppError,
+        error::{is_credential_expired_message, AppError},
         profile::{ConnectionProfile, SecretReference},
+        provider::ProviderType,
     },
     dto::{
         explorer::{
@@ -1072,7 +1073,9 @@ impl ProfileService {
     pub async fn head_object(&self, request: ObjectRequest) -> Result<ObjectMetadata, AppError> {
         let (profile, client, key) = self.object_context(&request).await?;
         let head = self.fetch_head(&client, &request.bucket, &key).await?;
-        Ok(metadata_from_head(&profile, &request, &key, &head))
+        let mut metadata = metadata_from_head(&profile, &request, &key, &head);
+        self.apply_share_capability(&profile, &mut metadata).await?;
+        Ok(metadata)
     }
 
     /// Replace editable HTTP/user metadata by copying an object onto itself.
@@ -1150,9 +1153,11 @@ impl ProfileService {
             .map_err(|error| AppError::Provider(safe_provider_message(&error)))?;
 
         let updated = self.fetch_head(&client, &request.bucket, &key).await?;
+        let mut metadata = metadata_from_head(&profile, &object_request, &key, &updated);
+        self.apply_share_capability(&profile, &mut metadata).await?;
         Ok(MetadataEditResult {
             schema_version: METADATA_SCHEMA_VERSION,
-            metadata: metadata_from_head(&profile, &object_request, &key, &updated),
+            metadata,
             warning: "Metadata replacement uses a non-atomic copy-on-self operation; the object may briefly be unavailable.".to_string(),
         })
     }
@@ -1168,7 +1173,7 @@ impl ProfileService {
         let (profile, client, key) = self.object_context(&object_request).await?;
         let head = self.fetch_head(&client, &request.bucket, &key).await?;
         let content_type = head.content_type().unwrap_or("application/octet-stream");
-        let Some(preview_kind) = preview_kind_for_content_type(content_type) else {
+        let Some(preview_kind) = preview_kind_for_object(content_type, &key) else {
             return Err(AppError::UnsupportedProviderFeature(
                 "preview is unavailable for this content type; use Properties or Download"
                     .to_string(),
@@ -1182,6 +1187,7 @@ impl ProfileService {
         // URL.  The UI clears this handle when the selected object changes;
         // it is never persisted or sent to diagnostics/history.
         if !matches!(preview_kind, PreviewKind::Text) {
+            self.ensure_presigned_get_supported(&profile).await?;
             let expires_in_seconds = 900_u32;
             let (url, expires_at) = self
                 .presigned_get(&client, &request.bucket, &key, expires_in_seconds)
@@ -1264,6 +1270,7 @@ impl ProfileService {
         };
         let (profile, client, key) = self.object_context(&object_request).await?;
         self.fetch_head(&client, &request.bucket, &key).await?;
+        self.ensure_presigned_get_supported(&profile).await?;
         let expires_in_seconds = normalize_share_expiry(request.expires_in_seconds);
         let (url, expires_at) = self
             .presigned_get(&client, &request.bucket, &key, expires_in_seconds)
@@ -1309,6 +1316,65 @@ impl ProfileService {
             .send()
             .await
             .map_err(|error| AppError::Provider(safe_provider_message(&error)))
+    }
+
+    async fn apply_share_capability(
+        &self,
+        profile: &ConnectionProfile,
+        metadata: &mut ObjectMetadata,
+    ) -> Result<(), AppError> {
+        let (supported, reason) = self.share_capability(profile).await?;
+        metadata.share_supported = supported;
+        metadata.share_reason = reason.clone();
+        // Binary previews and PDF use the same presigned GET capability as a
+        // share link. Text previews are bounded authenticated reads and remain
+        // available even when the provider cannot mint bearer URLs.
+        if !supported && !matches!(metadata.preview_kind, Some(PreviewKind::Text) | None) {
+            metadata.preview_supported = false;
+            metadata.preview_reason = reason;
+        }
+        Ok(())
+    }
+
+    async fn ensure_presigned_get_supported(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<(), AppError> {
+        let (supported, reason) = self.share_capability(profile).await?;
+        if supported {
+            return Ok(());
+        }
+        Err(AppError::UnsupportedProviderFeature(reason.unwrap_or_else(
+            || "temporary share links are unavailable for this provider".to_string(),
+        )))
+    }
+
+    async fn share_capability(
+        &self,
+        profile: &ConnectionProfile,
+    ) -> Result<(bool, Option<String>), AppError> {
+        let profile_id = profile.id.to_string();
+        let observed = self
+            .database
+            .get_profile_capabilities(&profile_id)
+            .await?
+            .and_then(|value| value.supports_presigned_get);
+        if observed == Some(false) {
+            return Ok((
+                false,
+                Some(
+                    "the provider capability check reported that presigned GET is unavailable"
+                        .to_string(),
+                ),
+            ));
+        }
+        if profile.provider == ProviderType::CustomS3 && observed != Some(true) {
+            return Ok((
+                false,
+                Some("share links are disabled for unknown/custom providers until a capability check confirms presigned GET support".to_string()),
+            ));
+        }
+        Ok((true, None))
     }
 
     async fn presigned_get(
@@ -1513,6 +1579,56 @@ fn preview_kind_for_content_type(content_type: &str) -> Option<PreviewKind> {
     None
 }
 
+/// S3-compatible gateways frequently return `application/octet-stream` for
+/// text files. A conservative extension fallback keeps common UTF-8 logs and
+/// config files previewable without ever treating active content as HTML.
+fn preview_kind_for_object(content_type: &str, key: &str) -> Option<PreviewKind> {
+    preview_kind_for_content_type(content_type).or_else(|| {
+        let media_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        if !media_type.is_empty() && media_type != "application/octet-stream" {
+            return None;
+        }
+        let extension = key
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, extension)| extension.to_ascii_lowercase());
+        extension.as_deref().and_then(|extension| {
+            matches!(
+                extension,
+                "txt"
+                    | "log"
+                    | "json"
+                    | "jsonl"
+                    | "xml"
+                    | "md"
+                    | "markdown"
+                    | "csv"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "ini"
+                    | "conf"
+                    | "cfg"
+                    | "properties"
+                    | "env"
+                    | "rs"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "css"
+            )
+            .then_some(PreviewKind::Text)
+        })
+    })
+}
+
 fn normalize_share_expiry(value: Option<u32>) -> u32 {
     value.unwrap_or(3_600).clamp(300, MAX_SHARE_SECONDS)
 }
@@ -1524,9 +1640,12 @@ fn metadata_from_head(
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
 ) -> ObjectMetadata {
     let content_type = head.content_type().map(ToString::to_string);
-    let preview_kind = content_type
-        .as_deref()
-        .and_then(preview_kind_for_content_type);
+    let preview_kind = preview_kind_for_object(
+        content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream"),
+        &request.key,
+    );
     let (preview_supported, preview_reason) = if preview_kind.is_some() {
         (true, None)
     } else if content_type.is_some() {
@@ -1577,6 +1696,10 @@ fn metadata_from_head(
         preview_supported,
         preview_kind,
         preview_reason,
+        // A metadata snapshot is refined by `apply_share_capability` before
+        // it crosses IPC. Keep conservative defaults for internal callers.
+        share_supported: false,
+        share_reason: Some("checking provider capability".to_string()),
     }
 }
 
@@ -1942,6 +2065,9 @@ fn entry_for_prefix(location: &ExplorerLocation, key: &str) -> EntrySummary {
 fn safe_provider_message(error: &impl std::fmt::Display) -> String {
     let message = error.to_string().replace(['\r', '\n'], " ");
     let lower = message.to_ascii_lowercase();
+    if is_credential_expired_message(&message) {
+        return "credential expired".to_string();
+    }
     // SDK display strings can include request URLs or authorization material.
     // Do not surface those values through the public IPC error envelope.
     if [
@@ -2089,6 +2215,11 @@ mod tests {
             Some(PreviewKind::Video)
         ));
         assert!(preview_kind_for_content_type("application/octet-stream").is_none());
+        assert!(matches!(
+            preview_kind_for_object("application/octet-stream", "logs/app.log"),
+            Some(PreviewKind::Text)
+        ));
+        assert!(preview_kind_for_object("application/octet-stream", "web/index.html").is_none());
     }
 
     #[test]
