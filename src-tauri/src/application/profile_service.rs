@@ -319,6 +319,7 @@ impl ProfileService {
                 (entry.credential_mode
                     == crate::domain::provider::CredentialMode::TemporarySession)
                     .then_some(placeholder_session),
+                true,
             ) {
                 Ok(profile) => profile,
                 Err(AppError::Validation(reason)) => {
@@ -369,6 +370,7 @@ impl ProfileService {
             now,
             has_secret.then(|| secret_reference.clone()),
             has_session.then(|| session_reference.clone()),
+            true,
         )?;
         let secret = required_secret(&draft)?;
         if let Err(error) = self.credentials.put(&secret_reference, secret).await {
@@ -534,6 +536,9 @@ impl ProfileService {
         {
             profile_draft.access_key_id = current.access_key_id.clone();
         }
+        let keep_credentialless = current.secret_reference.is_none()
+            && draft.secret_access_key.is_unchanged()
+            && draft.session_token.is_unchanged();
         let mut next = profile_from_draft(
             &profile_draft,
             current.id,
@@ -541,6 +546,7 @@ impl ProfileService {
             now,
             next_secret_reference.clone(),
             next_session_reference.clone(),
+            !keep_credentialless,
         )?;
         if draft.secret_access_key.is_unchanged() {
             next.secret_reference = current.secret_reference.clone();
@@ -900,6 +906,7 @@ impl ProfileService {
             now,
             test_secret_reference,
             test_session_reference,
+            false,
         )?;
         let existing_secret = if draft.secret_access_key.is_unchanged() {
             let reference = current
@@ -1695,7 +1702,12 @@ impl ProfileService {
             .get_profile(id)
             .await?
             .ok_or_else(|| AppError::ProfileNotFound(id.to_string()))?;
-        profile.validate()?;
+        // Profile settings may legitimately exist before credentials are
+        // entered (for example after importing a portable profile).  Keep
+        // credential-free profiles editable; operations that contact a
+        // provider resolve credentials explicitly and return a targeted
+        // credential error there.
+        profile.validate_configuration()?;
         Ok(profile)
     }
 
@@ -2180,6 +2192,7 @@ fn profile_from_draft(
     updated_at: chrono::DateTime<Utc>,
     secret_reference: Option<SecretReference>,
     session_reference: Option<SecretReference>,
+    require_credentials: bool,
 ) -> Result<ConnectionProfile, AppError> {
     if draft.schema_version != 1 {
         return Err(AppError::Validation(
@@ -2362,7 +2375,15 @@ fn profile_from_draft(
             "Static credentials cannot be cleared; enter a replacement secret".to_string(),
         ));
     }
-    profile.validate()?;
+    if require_credentials {
+        profile.validate()?;
+    } else {
+        // Connection tests need to reach their credential-resolution branch
+        // so imported profiles without a vault entry report an actionable
+        // "secret access key is required" message instead of failing while
+        // constructing a temporary profile with no reference.
+        profile.validate_configuration()?;
+    }
     Ok(profile)
 }
 
@@ -2627,6 +2648,37 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn credentialless_draft_is_editable_but_not_connection_ready() {
+        let draft = ProfileDraft {
+            schema_version: 1,
+            id: None,
+            name: "Imported profile".to_string(),
+            provider: ProviderType::CustomS3,
+            account_id: None,
+            endpoint: Some("https://s3.example.test".to_string()),
+            region: "us-east-1".to_string(),
+            credential_mode: CredentialMode::Static,
+            access_key_id: Some("access".to_string()),
+            secret_access_key: SecretInput::Unchanged,
+            session_token: SecretInput::Unchanged,
+            default_bucket: None,
+            root_prefix: None,
+            addressing_style: Some(AddressingStyle::Path),
+            allow_insecure_http: false,
+            favorite: false,
+        };
+        let now = Utc::now();
+        let imported =
+            profile_from_draft(&draft, Uuid::new_v4(), now, now, None, None, false).unwrap();
+        assert!(imported.validate_configuration().is_ok());
+        assert!(matches!(
+            imported.validate(),
+            Err(AppError::Validation(message))
+                if message == "A stored secret is required for credentials"
+        ));
     }
 
     #[test]
