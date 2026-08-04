@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.vite/
+
+# Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# Local application data and diagnostics
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Test/build scratch files
+work/
+coverage/

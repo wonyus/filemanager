@@ -1,0 +1,5 @@
+docs/s3-file-manager/
+pnpm-lock.yaml
+src-tauri/**/*.rs
+src-tauri/migrations/
+src-tauri/gen/
