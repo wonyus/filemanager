@@ -45,7 +45,17 @@ export function isPublicError(value: unknown): value is PublicError {
 }
 
 export function formatCommandError(value: unknown): string {
-  if (isPublicError(value)) return value.message;
+  if (isPublicError(value)) {
+    const reason = value.details?.reason;
+    if (
+      typeof reason === "string" &&
+      reason.trim() &&
+      reason.trim() !== value.message.trim()
+    ) {
+      return `${value.message} (${reason.trim()})`;
+    }
+    return value.message;
+  }
   if (value instanceof Error) return value.message;
   return "The operation could not be completed.";
 }

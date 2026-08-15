@@ -16,4 +16,14 @@ describe("public command errors", () => {
       "The operation could not be completed.",
     );
   });
+
+  it("shows a safe structured reason for actionable command failures", () => {
+    expect(
+      formatCommandError({
+        code: "PROVIDER_UNAVAILABLE",
+        message: "The provider operation could not be completed.",
+        details: { reason: "AccessDenied" },
+      }),
+    ).toBe("The provider operation could not be completed. (AccessDenied)");
+  });
 });

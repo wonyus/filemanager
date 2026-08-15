@@ -1273,6 +1273,19 @@ function ProfileCard({
             {providerLabels[profile.provider]} · {profile.region}
             {profile.defaultBucket ? ` · ${profile.defaultBucket}` : ""}
           </p>
+          <p
+            className={`mt-2 text-[11px] font-medium ${
+              profile.credentialState === "configured"
+                ? "text-emerald-700"
+                : "text-amber-700"
+            }`}
+          >
+            {profile.credentialState === "configured"
+              ? "Credentials ready"
+              : profile.credentialState === "missing"
+                ? "Credentials needed — open Edit to add them"
+                : "Secure credential store unavailable"}
+          </p>
         </button>
         <div className="flex items-center gap-2">
           <button
@@ -4148,6 +4161,9 @@ function DiagnosticsPanel({
   const showLogDirectory = async () => {
     try {
       const result = await commands.openLogDirectory();
+      if (hasNativeTauriRuntime()) {
+        await commands.openDestinationFolder(result.path);
+      }
       setMessage(`Log directory: ${result.path}`);
     } catch (error) {
       setMessage(formatCommandError(error));

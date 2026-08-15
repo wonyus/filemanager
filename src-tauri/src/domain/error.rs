@@ -138,6 +138,17 @@ pub struct PublicError {
 
 impl From<AppError> for PublicError {
     fn from(error: AppError) -> Self {
+        let reason = match &error {
+            // These values are validated or sanitized at the command
+            // boundary where possible, then normalized again here. Keeping
+            // them in structured details makes failures actionable without
+            // exposing raw SDK errors.
+            AppError::CredentialMissing(reason)
+            | AppError::UnsupportedProviderFeature(reason)
+            | AppError::TransferStateConflict(reason) => safe_reason(reason),
+            AppError::Provider(reason) => safe_provider_reason(reason),
+            _ => None,
+        };
         let (code, retryable, message) = match &error {
             AppError::Validation(message) => {
                 (AppErrorCode::ValidationFailed, false, message.clone())
@@ -268,6 +279,10 @@ impl From<AppError> for PublicError {
                 "The operation could not be completed.".to_string(),
             ),
         };
+        let mut details = BTreeMap::new();
+        if let Some(reason) = reason.filter(|value| !value.trim().is_empty()) {
+            details.insert("reason".to_string(), Value::String(reason));
+        }
         Self {
             schema_version: 1,
             code,
@@ -277,13 +292,58 @@ impl From<AppError> for PublicError {
             provider_request_id: None,
             correlation_id: None,
             field_errors: BTreeMap::new(),
-            details: BTreeMap::new(),
+            details,
         }
     }
 }
 
+fn safe_reason(reason: &str) -> Option<String> {
+    let normalized = reason.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut value = trimmed.chars().take(240).collect::<String>();
+    if trimmed.chars().count() > 240 {
+        value.push('…');
+    }
+    Some(value)
+}
+
+fn safe_provider_reason(reason: &str) -> Option<String> {
+    let normalized = reason.replace(['\r', '\n'], " ");
+    let lower = normalized.to_ascii_lowercase();
+    if is_credential_expired_message(&normalized) {
+        return Some("credential expired".to_string());
+    }
+    if [
+        "authorization",
+        "access key",
+        "secret",
+        "security token",
+        "signature",
+        "presign",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-algorithm",
+        "x-amz-date",
+        "http://",
+        "https://",
+        "akia",
+        "asia",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("provider request failed (sensitive details redacted)".to_string());
+    }
+    safe_reason(&normalized)
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::{is_credential_expired_message, AppError, AppErrorCode, PublicError};
 
     #[test]
@@ -305,5 +365,31 @@ mod tests {
         ));
         assert!(matches!(error.code, AppErrorCode::CredentialExpired));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn preserves_safe_provider_reason_in_details() {
+        let error = PublicError::from(AppError::Provider("AccessDenied".to_string()));
+        assert_eq!(
+            error.details.get("reason"),
+            Some(&Value::String("AccessDenied".to_string()))
+        );
+        assert_eq!(
+            error.message,
+            "The provider operation could not be completed."
+        );
+    }
+
+    #[test]
+    fn redacts_sensitive_provider_reason_in_details() {
+        let error = PublicError::from(AppError::Provider(
+            "request failed: https://access:secret@example.test?X-Amz-Signature=abc".to_string(),
+        ));
+        assert_eq!(
+            error.details.get("reason"),
+            Some(&Value::String(
+                "provider request failed (sensitive details redacted)".to_string()
+            ))
+        );
     }
 }
