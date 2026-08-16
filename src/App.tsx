@@ -2081,9 +2081,9 @@ function ExplorerPanel({
     <section
       id="explorer"
       role="tabpanel"
-      className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
+      className="rounded-3xl border border-border bg-panel p-4 shadow-soft"
     >
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold">Explorer</h2>
           <p className="mt-1 text-sm text-muted">
@@ -2181,7 +2181,7 @@ function ExplorerPanel({
           }
           tabIndex={0}
         >
-          <div className="mb-3 flex flex-wrap items-center gap-2">
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
             <button
               className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-semibold hover:bg-canvas disabled:opacity-40"
               type="button"
@@ -2322,7 +2322,7 @@ function ExplorerPanel({
             </div>
           </div>
           <div
-            className="mb-4 flex flex-wrap items-center gap-1 text-sm"
+            className="mb-2 flex flex-wrap items-center gap-1 text-xs"
             aria-label="Breadcrumb"
           >
             {breadcrumbs.map((crumb, index) => (
@@ -2331,7 +2331,7 @@ function ExplorerPanel({
                 key={`${crumb.prefix}-${crumb.label}`}
               >
                 <button
-                  className="rounded px-1.5 py-1 font-medium hover:bg-canvas"
+                  className="rounded px-1 py-0.5 font-medium hover:bg-canvas"
                   type="button"
                   ref={index === 0 ? breadcrumbRef : undefined}
                   onClick={() => navigatePrefix(crumb.prefix)}
@@ -2344,7 +2344,7 @@ function ExplorerPanel({
               </span>
             ))}
           </div>
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
             <span>
               {filter.trim()
                 ? `${visibleEntries.length} of ${loadedEntries.length} loaded items`
@@ -2356,7 +2356,7 @@ function ExplorerPanel({
               <div className="flex flex-wrap gap-2">
                 {selectedEntry && (
                   <button
-                    className="rounded-lg border border-border px-2.5 py-1.5 font-semibold text-ink hover:bg-canvas"
+                    className="rounded-lg border border-border px-2 py-1 font-semibold text-ink hover:bg-canvas"
                     type="button"
                     onClick={renameSelection}
                   >
@@ -2364,7 +2364,7 @@ function ExplorerPanel({
                   </button>
                 )}
                 <button
-                  className="rounded-lg border border-red-200 px-2.5 py-1.5 font-semibold text-red-700 hover:bg-red-50"
+                  className="rounded-lg border border-red-200 px-2 py-1 font-semibold text-red-700 hover:bg-red-50"
                   type="button"
                   onClick={deleteSelection}
                 >
