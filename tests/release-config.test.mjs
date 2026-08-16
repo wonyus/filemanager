@@ -72,4 +72,25 @@ describe("release configuration validation", () => {
       "S3FM_UPDATE_ARTIFACT_BASE_URL must use HTTPS",
     );
   });
+
+  it("allows certificate-free updater builds only with an explicit opt-in", () => {
+    setProtectedBuildEnv();
+    delete process.env.WINDOWS_CERTIFICATE_THUMBPRINT;
+
+    const protectedResult = validateReleaseConfig({
+      strict: true,
+      requireManifest: false,
+    });
+    expect(protectedResult.errors.join("\n")).toContain(
+      "WINDOWS_CERTIFICATE_THUMBPRINT is required",
+    );
+
+    const unsignedResult = validateReleaseConfig({
+      strict: true,
+      requireManifest: false,
+      allowUnsignedWindows: true,
+    });
+    expect(unsignedResult.errors).toEqual([]);
+    expect(unsignedResult.certificateThumbprint).toBeUndefined();
+  });
 });

@@ -4,7 +4,8 @@
  * Validate release-only configuration without ever printing secret values.
  * Normal CI may run this script with no environment and receives a clear
  * "not configured" result. A release job must pass --strict, which requires
- * updater and Authenticode inputs before it can produce artifacts.
+ * updater inputs and, unless explicitly opted into certificate-free mode,
+ * Authenticode inputs before it can produce artifacts.
  */
 
 import { pathToFileURL } from "node:url";
@@ -45,6 +46,7 @@ function validateHttpsUrl(errors, name, { required = false } = {}) {
 export function validateReleaseConfig({
   strict = false,
   requireManifest = true,
+  allowUnsignedWindows = false,
 } = {}) {
   const errors = [];
   const warnings = [];
@@ -93,9 +95,13 @@ export function validateReleaseConfig({
   }
 
   const certificateThumbprint = value("WINDOWS_CERTIFICATE_THUMBPRINT");
-  if (strict && !certificateThumbprint)
+  if (strict && !certificateThumbprint && !allowUnsignedWindows)
     errors.push(
       "WINDOWS_CERTIFICATE_THUMBPRINT is required for Authenticode signing",
+    );
+  if (strict && allowUnsignedWindows && !certificateThumbprint)
+    warnings.push(
+      "Certificate-free Windows mode is enabled; the installer will not have Authenticode publisher trust",
     );
   if (
     certificateThumbprint &&
@@ -181,9 +187,13 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   const strict = process.argv.includes("--strict");
+  const allowUnsignedWindows = process.argv.includes(
+    "--allow-unsigned-windows",
+  );
   const result = validateReleaseConfig({
     strict,
     requireManifest: !process.argv.includes("--config-only"),
+    allowUnsignedWindows,
   });
   for (const warning of result.warnings)
     console.warn(`release config warning: ${warning}`);

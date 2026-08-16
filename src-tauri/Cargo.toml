@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
-# The updater is compiled only by the protected release workflow.  Keeping it
+# The updater is compiled only by protected release workflows. Keeping it
 # optional means normal development/PR builds do not need a public key or
 # manifest endpoint and fail closed when release configuration is absent.
 updater = ["dep:tauri-plugin-updater"]

@@ -52,6 +52,23 @@ Authenticode input is missing, malformed, local, or a placeholder. The two
 generator scripts write ignored files under `dist/` and refuse to overwrite
 an existing output. The private key remains in the runner environment.
 
+The certificate-free path is an explicit opt-in for environments that do not
+have a Windows Authenticode certificate:
+
+```text
+node scripts/validate-release-config.mjs --strict --config-only --allow-unsigned-windows
+node scripts/generate-tauri-release-config.mjs --allow-unsigned-windows
+node scripts/generate-update-manifest.mjs --allow-unsigned-windows
+```
+
+This mode still requires `TAURI_UPDATER_PUBLIC_KEY`,
+`TAURI_SIGNING_PRIVATE_KEY`, and the updater signing password when applicable.
+It omits `certificateThumbprint` from the generated Tauri overlay and builds
+the NSIS installer with `--no-sign`. The updater archive and manifest remain
+Tauri-signed, so update authenticity and tamper rejection are preserved. The
+installer itself is not publisher-signed: Windows may show Unknown Publisher
+or a SmartScreen warning on the first install.
+
 `src-tauri/tauri.conf.json` keeps the development installer safe by default:
 per-user NSIS installation, WebView2 bootstrapper handling, and downgrade
 blocking. The generated release overlay additionally enables signed updater
@@ -86,16 +103,23 @@ is protected by the `protected-release` environment.
 For a certificate-free development build, use
 `.github/workflows/preview-release.yml`. It publishes a prerelease with an
 unsigned NSIS installer and `checksums.txt` only. It deliberately does not
-enable the updater feature and must not be promoted as a production release.
+enable the updater feature.
 
-The optional `updater` Cargo feature is enabled only by that protected
-workflow. Development/PR binaries return a typed “not configured” result from
+For a certificate-free release that still supports in-app updates, use
+`.github/workflows/certificate-free-release.yml`. It requires only the three
+protected Tauri updater secrets, publishes the signed updater archive,
+signature, and channel manifest, and intentionally omits Authenticode. Users
+must install that first build manually; once installed, later in-app updates
+can use the signed updater. The release notes always disclose the expected
+Windows publisher/SmartScreen warning.
+
+The optional `updater` Cargo feature is enabled only by the protected release
+workflows. Development/PR binaries return a typed “not configured” result from
 Check updates and cannot install an update. Release binaries use the Tauri
 updater plugin, verify the embedded public key and manifest signature, require
 the exact `INSTALL UPDATE <version>` confirmation phrase, and check active
 transfers both before download and immediately before installation.
 
-An Authenticode certificate must be installed in the runner's CurrentUser
-certificate store (or supplied as the documented PFX path/password pair). No
-secret values belong in repository files, generated overlays, logs, or
-diagnostics exports.
+The standard protected workflow still requires an Authenticode certificate to
+provide Windows publisher trust. No secret values belong in repository files,
+generated overlays, logs, or diagnostics exports.

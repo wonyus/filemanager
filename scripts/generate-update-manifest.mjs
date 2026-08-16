@@ -4,7 +4,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { validateReleaseConfig, value } from "./validate-release-config.mjs";
 
-const config = validateReleaseConfig({ strict: true });
+const allowUnsignedWindows = process.argv.includes("--allow-unsigned-windows");
+const config = validateReleaseConfig({ strict: true, allowUnsignedWindows });
 if (config.errors.length) {
   console.error(
     "Cannot generate an updater manifest because release configuration is incomplete:",

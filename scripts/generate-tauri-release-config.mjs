@@ -11,10 +11,16 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { validateReleaseConfig, value } from "./validate-release-config.mjs";
 
+const allowUnsignedWindows = process.argv.includes("--allow-unsigned-windows");
+
 // Build configuration is generated before the updater archive exists.  The
 // archive URL/signature are validated by generate-update-manifest.mjs after
 // the protected build has produced the `.sig` file.
-const config = validateReleaseConfig({ strict: true, requireManifest: false });
+const config = validateReleaseConfig({
+  strict: true,
+  requireManifest: false,
+  allowUnsignedWindows,
+});
 if (config.errors.length) {
   console.error(
     "Cannot generate Tauri release config because release configuration is incomplete:",
@@ -36,7 +42,9 @@ const generated = {
     createUpdaterArtifacts: "v1Compatible",
     windows: {
       digestAlgorithm: "sha256",
-      certificateThumbprint: config.certificateThumbprint,
+      ...(config.certificateThumbprint
+        ? { certificateThumbprint: config.certificateThumbprint }
+        : {}),
       webviewInstallMode: {
         type: "downloadBootstrapper",
         silent: true,

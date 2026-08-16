@@ -16,7 +16,7 @@ The MVP implementation is in place for the Windows-first release:
 - Redacted diagnostics export, settings persistence, and a per-user NSIS installer are included.
 - CI checks frontend lint/test/build, Rust format/test/clippy, and Windows NSIS packaging.
 
-The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Session pause/range resume and durable multipart checkpoints are implemented. Release-only updater signing and provider smoke checks are wired through protected environment configuration; see [`docs/s3-file-manager/release-hardening.md`](docs/s3-file-manager/release-hardening.md) and [`docs/s3-file-manager/provider-smoke.md`](docs/s3-file-manager/provider-smoke.md).
+The implementation specification is in [`docs/s3-file-manager/s3-file-manager-sdd.md`](docs/s3-file-manager/s3-file-manager-sdd.md). Session pause/range resume and durable multipart checkpoints are implemented. Release-only updater signing and provider smoke checks are wired through protected environment configuration; both Authenticode-protected and certificate-free signed-updater release paths are documented in [`docs/s3-file-manager/release-hardening.md`](docs/s3-file-manager/release-hardening.md). See [`docs/s3-file-manager/provider-smoke.md`](docs/s3-file-manager/provider-smoke.md) for provider checks.
 
 ## Development
 
