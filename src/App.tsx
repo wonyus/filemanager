@@ -2344,7 +2344,7 @@ function ExplorerPanel({
               </span>
             ))}
           </div>
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+          <div className="mb-2 flex min-h-7 flex-wrap items-center justify-between gap-2 text-xs text-muted">
             <span>
               {filter.trim()
                 ? `${visibleEntries.length} of ${loadedEntries.length} loaded items`
@@ -2352,26 +2352,27 @@ function ExplorerPanel({
               {listing?.nextToken ? " · Sorted loaded results" : ""}
               {selectedIds.size ? ` · ${selectedIds.size} selected` : ""}
             </span>
-            {selectedIds.size > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {selectedEntry && (
-                  <button
-                    className="rounded-lg border border-border px-2 py-1 font-semibold text-ink hover:bg-canvas"
-                    type="button"
-                    onClick={renameSelection}
-                  >
-                    Rename
-                  </button>
-                )}
+            <div
+              className={`flex min-h-7 flex-nowrap gap-2 ${selectedIds.size > 0 ? "" : "invisible"}`}
+              aria-hidden={selectedIds.size === 0}
+            >
+              {selectedEntry && (
                 <button
-                  className="rounded-lg border border-red-200 px-2 py-1 font-semibold text-red-700 hover:bg-red-50"
+                  className="rounded-lg border border-border px-2 py-1 font-semibold text-ink hover:bg-canvas"
                   type="button"
-                  onClick={deleteSelection}
+                  onClick={renameSelection}
                 >
-                  Delete selected
+                  Rename
                 </button>
-              </div>
-            )}
+              )}
+              <button
+                className="rounded-lg border border-red-200 px-2 py-1 font-semibold text-red-700 hover:bg-red-50"
+                type="button"
+                onClick={deleteSelection}
+              >
+                Delete selected
+              </button>
+            </div>
           </div>
           {visibleEntries.length > 0 ? (
             viewMode === "list" ? (
