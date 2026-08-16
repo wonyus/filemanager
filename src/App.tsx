@@ -1101,7 +1101,7 @@ function App() {
             </>
           )}
 
-          <footer className="flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-muted">
+          <footer className="mt-auto flex flex-wrap items-center justify-between gap-2 px-1 pt-4 text-xs text-muted">
             <span>
               {appInfo?.productName ?? "S3 File Manager"}{" "}
               {appInfo?.version ?? "0.1.0"}
