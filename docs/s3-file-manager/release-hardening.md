@@ -65,9 +65,10 @@ This mode still requires `TAURI_UPDATER_PUBLIC_KEY`,
 `TAURI_SIGNING_PRIVATE_KEY`, and the updater signing password when applicable.
 It omits `certificateThumbprint` from the generated Tauri overlay and builds
 the NSIS installer with `--no-sign`. The updater archive and manifest remain
-Tauri-signed, so update authenticity and tamper rejection are preserved. The
-installer itself is not publisher-signed: Windows may show Unknown Publisher
-or a SmartScreen warning on the first install.
+Tauri-signed by a separate `tauri signer sign` step, so update authenticity and
+tamper rejection are preserved. The installer itself is not publisher-signed:
+Windows may show Unknown Publisher or a SmartScreen warning on the first
+install.
 
 `src-tauri/tauri.conf.json` keeps the development installer safe by default:
 per-user NSIS installation, WebView2 bootstrapper handling, and downgrade

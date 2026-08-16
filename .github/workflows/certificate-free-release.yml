@@ -75,8 +75,18 @@ jobs:
         run: node scripts/validate-release-config.mjs --strict --config-only --allow-unsigned-windows
       - name: Generate unsigned-Windows Tauri overlay
         run: node scripts/generate-tauri-release-config.mjs --allow-unsigned-windows
-      - name: Build unsigned NSIS installer and signed updater artifacts
+      - name: Build unsigned NSIS installer and updater archive
         run: pnpm tauri build --bundles nsis --features updater --no-sign --config dist/tauri.release.conf.json
+      - name: Sign updater archive with the protected Tauri key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem src-tauri/target/release/bundle -Recurse -File -Filter '*.zip' | Where-Object { $_.Name -notlike '*.sig' } | Select-Object -First 1
+          if (-not $zip) { throw 'Tauri updater archive was not generated' }
+          pnpm tauri signer sign $zip.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri updater archive signing failed' }
+          $sigPath = "$($zip.FullName).sig"
+          if (-not (Test-Path -LiteralPath $sigPath)) { throw "Updater signature was not generated: $sigPath" }
       - name: Derive updater URL and installer path
         shell: pwsh
         run: |
