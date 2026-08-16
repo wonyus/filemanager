@@ -540,8 +540,8 @@ function App() {
   const activeCopy = sectionCopy[activeSection];
 
   return (
-    <main className="min-h-screen bg-canvas text-ink">
-      <div className="mx-auto flex min-h-screen w-full max-w-[1920px] flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
+    <main className="h-screen overflow-hidden bg-canvas text-ink">
+      <div className="mx-auto flex h-full min-h-0 w-full max-w-[1920px] flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
         <header className="rounded-3xl border border-border bg-panel p-3 shadow-soft sm:p-4">
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex shrink-0 items-center gap-3 px-2 py-1">
@@ -587,7 +587,7 @@ function App() {
           </div>
         </header>
 
-        <section className="flex min-w-0 flex-1 flex-col gap-6">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-y-auto">
           {activeSection === "settings" && (
             <header className="flex flex-wrap items-center justify-between gap-4">
               <div>
@@ -711,7 +711,7 @@ function App() {
 
           {activeSection === "explorer" && (
             <>
-              <div className="grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
+              <div className="grid min-h-0 min-w-0 flex-1 items-stretch gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
                 <div className="min-w-0">
                   <ExplorerPanel
                     profile={selectedSummary}
@@ -1011,7 +1011,7 @@ function App() {
                   />
                 </div>
 
-                <div className="min-w-0 xl:sticky xl:top-6 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
+                <div className="min-h-0 min-w-0 xl:sticky xl:top-6 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto">
                   <ObjectInspector
                     metadata={metadata}
                     preview={preview}
@@ -2081,7 +2081,7 @@ function ExplorerPanel({
     <section
       id="explorer"
       role="tabpanel"
-      className="rounded-3xl border border-border bg-panel p-4 shadow-soft"
+      className="flex h-full min-h-0 flex-col rounded-3xl border border-border bg-panel p-4 shadow-soft"
     >
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -2167,11 +2167,11 @@ function ExplorerPanel({
         </div>
       ) : (
         <div
-          className={
+          className={`flex min-h-0 flex-1 flex-col ${
             dropTargetId === "__current__"
               ? "rounded-2xl outline outline-2 outline-accent/60 outline-offset-2"
-              : undefined
-          }
+              : ""
+          }`}
           onKeyDown={handleKeyDown}
           onContextMenu={(event) => openContextMenu(event)}
           onDragOver={(event) => allowRemoteDrop(event, "__current__")}
@@ -2377,7 +2377,7 @@ function ExplorerPanel({
           {visibleEntries.length > 0 ? (
             viewMode === "list" ? (
               <div
-                className="max-h-[60vh] overflow-auto rounded-2xl border border-border"
+                className="min-h-0 flex-1 overflow-auto rounded-2xl border border-border"
                 role="grid"
                 aria-label="Loaded objects"
               >
@@ -2484,7 +2484,7 @@ function ExplorerPanel({
                 ))}
               </div>
             ) : (
-              <div className="max-h-[60vh] overflow-y-auto rounded-2xl border border-border p-3">
+              <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-border p-3">
                 <div
                   className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
                   role="grid"
