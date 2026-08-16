@@ -2829,6 +2829,15 @@ function ObjectInspector({
             >
               Create share link
             </button>
+            {shareLink && (
+              <button
+                className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas"
+                type="button"
+                onClick={() => void copyShareLink()}
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -3000,13 +3009,6 @@ function ObjectInspector({
               readOnly
               aria-label="Temporary share link"
             />
-            <button
-              className="rounded-xl border border-border px-3 py-2 text-xs font-semibold hover:bg-canvas"
-              type="button"
-              onClick={() => void copyShareLink()}
-            >
-              {copied ? "Copied" : "Copy"}
-            </button>
           </div>
           <p className="mt-1 text-xs text-muted">
             Expires {new Date(shareLink.expiresAt).toLocaleString()}
