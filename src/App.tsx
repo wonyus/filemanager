@@ -588,28 +588,21 @@ function App() {
         </header>
 
         <section className="flex min-w-0 flex-1 flex-col gap-6">
-          <header className="flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <p className="mb-1 text-xs font-semibold uppercase tracking-[0.2em] text-accent">
-                Workspace
-              </p>
-              <h1 className="text-3xl font-semibold tracking-tight">
-                {activeCopy.title}
-              </h1>
-              <p className="mt-2 max-w-2xl text-sm text-muted">
-                {activeCopy.description}
-              </p>
-            </div>
-            {activeSection === "profiles" && (
-              <button
-                className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground shadow-sm transition hover:brightness-95"
-                type="button"
-                onClick={() => openEditor()}
-              >
-                Add profile
-              </button>
-            )}
-          </header>
+          {activeSection === "settings" && (
+            <header className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <p className="mb-1 text-xs font-semibold uppercase tracking-[0.2em] text-accent">
+                  Workspace
+                </p>
+                <h1 className="text-3xl font-semibold tracking-tight">
+                  {activeCopy.title}
+                </h1>
+                <p className="mt-2 max-w-2xl text-sm text-muted">
+                  {activeCopy.description}
+                </p>
+              </div>
+            </header>
+          )}
 
           {error && (
             <div
@@ -642,6 +635,13 @@ function App() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    className="rounded-xl bg-accent px-3 py-2 text-xs font-semibold text-accent-foreground shadow-sm transition hover:brightness-95"
+                    type="button"
+                    onClick={() => openEditor()}
+                  >
+                    Add profile
+                  </button>
                   <input
                     ref={profileImportRef}
                     className="hidden"
