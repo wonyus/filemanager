@@ -68,7 +68,8 @@ the NSIS installer with `--no-sign`. The updater archive and manifest remain
 Tauri-signed by a separate `tauri signer sign` step, so update authenticity and
 tamper rejection are preserved. The installer itself is not publisher-signed:
 Windows may show Unknown Publisher or a SmartScreen warning on the first
-install.
+install. Release asset names are normalized before signing so the manifest URL,
+signature metadata, and GitHub asset URL remain identical.
 
 `src-tauri/tauri.conf.json` keeps the development installer safe by default:
 per-user NSIS installation, WebView2 bootstrapper handling, and downgrade
