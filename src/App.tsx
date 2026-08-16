@@ -541,30 +541,29 @@ function App() {
 
   return (
     <main className="min-h-screen bg-canvas text-ink">
-      <div className="mx-auto flex min-h-screen w-full max-w-[1920px] gap-6 px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
-        <aside className="hidden w-64 shrink-0 flex-col rounded-3xl border border-border bg-panel p-4 shadow-soft lg:flex">
-          <div className="mb-8 flex items-center gap-3 px-3 py-2">
-            <div className="grid size-10 place-items-center rounded-2xl bg-accent text-lg font-bold text-accent-foreground">
-              S3
+      <div className="mx-auto flex min-h-screen w-full max-w-[1920px] flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
+        <header className="rounded-3xl border border-border bg-panel p-3 shadow-soft sm:p-4">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex shrink-0 items-center gap-3 px-2 py-1">
+              <div className="grid size-10 place-items-center rounded-2xl bg-accent text-lg font-bold text-accent-foreground">
+                S3
+              </div>
+              <div>
+                <p className="font-semibold tracking-tight">S3 File Manager</p>
+                <p className="text-xs text-muted">Desktop workspace</p>
+              </div>
             </div>
-            <div>
-              <p className="font-semibold tracking-tight">S3 File Manager</p>
-              <p className="text-xs text-muted">Desktop workspace</p>
-            </div>
-          </div>
-          <nav
-            className="space-y-1"
-            aria-label="Workspace tabs"
-            role="tablist"
-            aria-orientation="vertical"
-          >
-            {navigation.map((item) => {
-              return (
+            <nav
+              className="flex min-w-0 flex-1 gap-1 overflow-x-auto rounded-2xl bg-canvas p-1"
+              aria-label="Workspace tabs"
+              role="tablist"
+            >
+              {navigation.map((item) => (
                 <button
-                  className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition ${
+                  className={`flex shrink-0 items-center gap-2 rounded-xl px-3 py-2.5 text-sm transition sm:px-4 ${
                     activeSection === item.section
                       ? "bg-accent/10 font-semibold text-accent"
-                      : "text-muted hover:bg-black/[.03] hover:text-ink"
+                      : "text-muted hover:bg-panel hover:text-ink"
                   }`}
                   key={item.label}
                   type="button"
@@ -576,51 +575,19 @@ function App() {
                     activeSection === item.section ? "page" : undefined
                   }
                 >
-                  <span aria-hidden="true" className="w-5 text-center">
-                    {item.icon}
-                  </span>
+                  <span aria-hidden="true">{item.icon}</span>
                   {item.label}
                 </button>
-              );
-            })}
-          </nav>
-          <div className="mt-auto rounded-2xl bg-canvas p-4 text-xs text-muted">
-            <p className="mb-2 font-semibold text-ink">Secure profile vault</p>
-            <p>
-              Secrets stay behind the Rust credential boundary and are never
-              rendered here.
-            </p>
+              ))}
+            </nav>
+            <div className="hidden max-w-xs rounded-2xl bg-canvas px-3 py-2 text-xs text-muted xl:block">
+              <p className="font-semibold text-ink">Secure profile vault</p>
+              <p>Secrets stay behind the Rust credential boundary.</p>
+            </div>
           </div>
-        </aside>
+        </header>
 
         <section className="flex min-w-0 flex-1 flex-col gap-6">
-          <nav
-            className="flex gap-2 overflow-x-auto rounded-2xl border border-border bg-panel p-2 shadow-soft lg:hidden"
-            aria-label="Workspace tabs"
-            role="tablist"
-          >
-            {navigation.map((item) => (
-              <button
-                className={`flex shrink-0 items-center gap-2 rounded-xl px-3 py-2 text-sm transition ${
-                  activeSection === item.section
-                    ? "bg-accent/10 font-semibold text-accent"
-                    : "text-muted hover:bg-canvas hover:text-ink"
-                }`}
-                key={item.label}
-                type="button"
-                onClick={() => navigate(item.section)}
-                role="tab"
-                aria-selected={activeSection === item.section}
-                aria-controls={item.section}
-                aria-current={
-                  activeSection === item.section ? "page" : undefined
-                }
-              >
-                <span aria-hidden="true">{item.icon}</span>
-                {item.label}
-              </button>
-            ))}
-          </nav>
           <header className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <p className="mb-1 text-xs font-semibold uppercase tracking-[0.2em] text-accent">
