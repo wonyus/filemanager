@@ -715,7 +715,7 @@ function App() {
 
           {activeSection === "explorer" && (
             <>
-              <div className="grid min-h-0 min-w-0 flex-1 items-stretch gap-6 overflow-hidden xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
+              <div className="grid min-h-0 min-w-0 flex-1 items-stretch gap-6 overflow-hidden xl:grid-cols-[minmax(0,1fr)_minmax(28rem,34rem)]">
                 <div className="flex min-h-0 min-w-0 flex-col">
                   <ExplorerPanel
                     profile={selectedSummary}
