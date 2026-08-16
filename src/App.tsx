@@ -587,7 +587,11 @@ function App() {
           </div>
         </header>
 
-        <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-y-auto">
+        <section
+          className={`flex min-h-0 min-w-0 flex-1 flex-col gap-6 ${
+            activeSection === "explorer" ? "overflow-hidden" : "overflow-y-auto"
+          }`}
+        >
           {activeSection === "settings" && (
             <header className="flex flex-wrap items-center justify-between gap-4">
               <div>
@@ -711,8 +715,8 @@ function App() {
 
           {activeSection === "explorer" && (
             <>
-              <div className="grid min-h-0 min-w-0 flex-1 items-stretch gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
-                <div className="min-w-0">
+              <div className="grid min-h-0 min-w-0 flex-1 items-stretch gap-6 overflow-hidden xl:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
+                <div className="flex min-h-0 min-w-0 flex-col">
                   <ExplorerPanel
                     profile={selectedSummary}
                     activeProfile={activeProfile}
@@ -2377,7 +2381,7 @@ function ExplorerPanel({
           {visibleEntries.length > 0 ? (
             viewMode === "list" ? (
               <div
-                className="min-h-0 flex-1 overflow-auto rounded-2xl border border-border"
+                className="min-h-0 max-h-[calc(100vh-16rem)] flex-1 overflow-auto rounded-2xl border border-border"
                 role="grid"
                 aria-label="Loaded objects"
               >
@@ -2484,7 +2488,7 @@ function ExplorerPanel({
                 ))}
               </div>
             ) : (
-              <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-border p-3">
+              <div className="min-h-0 max-h-[calc(100vh-16rem)] flex-1 overflow-y-auto rounded-2xl border border-border p-3">
                 <div
                   className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
                   role="grid"
