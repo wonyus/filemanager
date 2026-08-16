@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha384};
 use sqlx::{
+    migrate::{MigrateError, Migrator},
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
     Row, SqlitePool,
 };
@@ -26,6 +28,8 @@ use crate::{
         },
     },
 };
+
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 pub struct Database {
@@ -73,7 +77,21 @@ impl Database {
             .max_connections(5)
             .connect_with(options)
             .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        match MIGRATOR.run(&pool).await {
+            Ok(()) => {}
+            Err(error @ MigrateError::VersionMismatch(_)) => {
+                // SQLx hashes the migration bytes exactly.  Windows checkouts
+                // can turn LF into CRLF, which makes an otherwise identical
+                // migration look modified between a dev build and a release.
+                // Repair only that exact line-ending variant; any real SQL
+                // edit still fails closed with the original mismatch error.
+                if repair_line_ending_checksums(&pool).await? == 0 {
+                    return Err(AppError::DatabaseMigration(error));
+                }
+                MIGRATOR.run(&pool).await?;
+            }
+            Err(error) => return Err(AppError::DatabaseMigration(error)),
+        }
         Ok(Self { pool })
     }
 
@@ -1361,6 +1379,43 @@ fn validate_schema_version(version: u16) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn repair_line_ending_checksums(pool: &SqlitePool) -> Result<u64, AppError> {
+    let rows = sqlx::query("SELECT version, checksum FROM _sqlx_migrations WHERE success = TRUE")
+        .fetch_all(pool)
+        .await?;
+    let mut repaired = 0;
+    for row in rows {
+        let version: i64 = row.try_get("version")?;
+        let stored: Vec<u8> = row.try_get("checksum")?;
+        let Some(migration) = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == version)
+        else {
+            continue;
+        };
+        if migration.checksum.as_ref() == stored.as_slice()
+            || !matches_line_ending_checksum(&migration.sql, &stored)
+        {
+            continue;
+        }
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+            .bind(migration.checksum.as_ref())
+            .bind(version)
+            .execute(pool)
+            .await?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
+fn matches_line_ending_checksum(sql: &str, stored: &[u8]) -> bool {
+    let normalized_lf = sql.replace("\r\n", "\n");
+    let normalized_crlf = normalized_lf.replace('\n', "\r\n");
+    let lf_checksum = Sha384::digest(normalized_lf.as_bytes());
+    let crlf_checksum = Sha384::digest(normalized_crlf.as_bytes());
+    stored == lf_checksum.as_slice() || stored == crlf_checksum.as_slice()
+}
+
 async fn ensure_profile_exists(database: &Database, profile_id: &str) -> Result<(), AppError> {
     if profile_id.trim().is_empty() {
         return Err(AppError::Validation("profile ID is required".to_string()));
@@ -1519,6 +1574,53 @@ fn redacted_endpoint_display(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_ending_checksum_repair_is_conservative() {
+        let sql = "CREATE TABLE example (id INTEGER);\n";
+        let lf_checksum = Sha384::digest(sql.as_bytes());
+        let crlf_sql = sql.replace('\n', "\r\n");
+        let crlf_checksum = Sha384::digest(crlf_sql.as_bytes());
+
+        assert!(matches_line_ending_checksum(sql, lf_checksum.as_slice()));
+        assert!(matches_line_ending_checksum(sql, crlf_checksum.as_slice()));
+        assert!(!matches_line_ending_checksum(
+            "CREATE TABLE different (id INTEGER);\n",
+            lf_checksum.as_slice()
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_repairs_line_ending_only_migration_drift() {
+        let path = std::env::temp_dir().join(format!(
+            "s3-file-manager-migration-line-endings-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let database = Database::connect(&path).await.unwrap();
+        for migration in MIGRATOR.iter() {
+            let normalized_lf = migration.sql.replace("\r\n", "\n");
+            let crlf_sql = normalized_lf.replace('\n', "\r\n");
+            let crlf_checksum = Sha384::digest(crlf_sql.as_bytes());
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(crlf_checksum.as_slice())
+                .bind(migration.version)
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        drop(database);
+
+        let repaired = Database::connect(&path).await.unwrap();
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&repaired.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, MIGRATOR.iter().next().unwrap().checksum.as_ref());
+
+        drop(repaired);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn multipart_checkpoint_round_trips_and_clears() {
