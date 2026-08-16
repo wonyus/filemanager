@@ -627,21 +627,6 @@ function App() {
             </div>
           )}
 
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Metric
-              label="Saved profiles"
-              value={loading ? "…" : String(profiles.length)}
-            />
-            <Metric
-              label="Database schema"
-              value={settings ? `v${settings.schemaVersion}` : "…"}
-            />
-            <Metric
-              label="Implementation phase"
-              value={appInfo?.phase ?? "profiles"}
-            />
-          </div>
-
           {activeSection === "profiles" && (
             <section
               id="profiles"
@@ -1089,6 +1074,20 @@ function App() {
 
           {activeSection === "settings" && (
             <>
+              <div className="grid gap-4 sm:grid-cols-3">
+                <Metric
+                  label="Saved profiles"
+                  value={loading ? "…" : String(profiles.length)}
+                />
+                <Metric
+                  label="Database schema"
+                  value={settings ? `v${settings.schemaVersion}` : "…"}
+                />
+                <Metric
+                  label="Implementation phase"
+                  value={appInfo?.phase ?? "profiles"}
+                />
+              </div>
               <SettingsPanel
                 id="settings"
                 settings={settings}
