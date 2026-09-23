@@ -26,6 +26,7 @@ import type {
   ShareLinkRequest,
   SettingsSnapshot,
   StartTransferRequest,
+  CollisionPolicy,
   TransferHistoryPage,
   TransferDetails,
   TransferJob,
@@ -127,13 +128,13 @@ export const commands = {
     invoke<ShareLink>("create_share_link", { request }),
   startTransfer: (request: StartTransferRequest) =>
     invoke<TransferJob>("start_transfer", { request }),
-  listTransfers: (includeActive = true) =>
+  listTransfers: (includeActive = true, offset = 0, limit = 100) =>
     invoke<TransferHistoryPage>("list_transfers", {
       request: {
         schemaVersion: 1,
         includeActive,
-        limit: 100,
-        offset: 0,
+        limit,
+        offset,
       },
     }),
   getTransferDetails: (transferId: string) =>
@@ -146,6 +147,14 @@ export const commands = {
     invoke<TransferJob>("cancel_transfer", { transferId }),
   retryTransfer: (transferId: string) =>
     invoke<TransferJob>("retry_transfer", { transferId }),
+  resolveTransferCollision: (
+    transferId: string,
+    collisionPolicy: CollisionPolicy,
+  ) =>
+    invoke<TransferJob>("resolve_transfer_collision", {
+      transferId,
+      collisionPolicy,
+    }),
   clearTransferHistory: () =>
     invoke<number>("clear_transfer_history", {
       request: { schemaVersion: 1, before: null, includeFailed: true },

@@ -75,7 +75,7 @@ fn require_delete_confirmation(actual: &str, expected: Option<&str>) -> Result<(
 use crate::{
     application::profile_service::ProfileService,
     domain::{
-        error::{is_credential_expired_message, AppError, PublicError},
+        error::{is_credential_expired_message, AppError, AppErrorCode, PublicError},
         profile::ConnectionProfile,
     },
     dto::{
@@ -217,6 +217,127 @@ impl TransferService {
             worker.run(job.id, request).await;
         });
         Ok(job)
+    }
+
+    /// Resolve a recursive destination collision by cloning the failed
+    /// terminal transfer with an explicit collision policy. The original job
+    /// remains immutable in history and the new job follows the regular
+    /// scheduler/worker path.
+    pub async fn resolve_collision(
+        &self,
+        id: Uuid,
+        collision_policy: CollisionPolicy,
+    ) -> Result<TransferJob, AppError> {
+        if matches!(collision_policy, CollisionPolicy::Ask) {
+            return Err(AppError::Validation(
+                "choose a concrete collision policy before retrying".to_string(),
+            ));
+        }
+        if collision_policy == CollisionPolicy::Rename {
+            return Err(AppError::Validation(
+                "rename collision resolution is not available for this transfer".to_string(),
+            ));
+        }
+        let previous = self
+            .manager
+            .get(id)
+            .await
+            .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+        if !previous.status.is_terminal() || previous.collision_policy != CollisionPolicy::Ask {
+            return Err(AppError::Validation(
+                "only a finished transfer waiting on collision resolution can be resolved"
+                    .to_string(),
+            ));
+        }
+        let details = self.manager.details(id).await?;
+        let has_collision = details.items.iter().any(|item| {
+            item.error
+                .as_ref()
+                .is_some_and(|error| error.code == AppErrorCode::DestinationExists)
+        }) || details
+            .job
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == AppErrorCode::DestinationExists);
+        if !has_collision {
+            return Err(AppError::Validation(
+                "the transfer has no unresolved destination collision".to_string(),
+            ));
+        }
+        let mut request =
+            self.manager.request(id).await.ok_or_else(|| {
+                AppError::Unknown("transfer request was not retained".to_string())
+            })?;
+        request.collision_policy = collision_policy;
+        let job = self.manager.retry_with_request(id, request.clone()).await?;
+        let worker = self.clone();
+        tokio::spawn(async move {
+            worker.run(job.id, request).await;
+        });
+        Ok(job)
+    }
+
+    /// Abort durable provider multipart sessions left behind by a crash or a
+    /// forced shutdown. A checkpoint is removed only after a successful abort
+    /// (or an idempotent not-found response); missing credentials/profiles are
+    /// retained for a later retry instead of being silently discarded.
+    pub async fn cleanup_orphaned_multipart_uploads(&self) -> Result<usize, AppError> {
+        let uploads = self.manager.list_multipart_uploads().await?;
+        let mut cleaned = 0usize;
+        for upload in uploads {
+            let Some(profile_id) = upload.profile_id.as_deref() else {
+                tracing::warn!(transfer_id = %upload.transfer_id, "retaining multipart checkpoint without a profile");
+                continue;
+            };
+            let profile = match self.profiles.get_connection_profile(profile_id).await {
+                Ok(profile) => profile,
+                Err(error) => {
+                    tracing::warn!(transfer_id = %upload.transfer_id, error = %error, "retaining multipart checkpoint because its profile is unavailable");
+                    continue;
+                }
+            };
+            let credentials = match resolve_profile_credentials(self.credentials.as_ref(), &profile)
+                .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    tracing::warn!(transfer_id = %upload.transfer_id, error = %error, "retaining multipart checkpoint because credentials are unavailable");
+                    continue;
+                }
+            };
+            let client = match self.clients.get_or_create(&profile, &credentials).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(transfer_id = %upload.transfer_id, error = %error, "retaining multipart checkpoint because the provider client could not be created");
+                    continue;
+                }
+            };
+            let abort_result = client
+                .abort_multipart_upload()
+                .bucket(&upload.bucket)
+                .key(&upload.object_key)
+                .upload_id(&upload.upload_id)
+                .send()
+                .await;
+            match abort_result {
+                Ok(_) => {
+                    self.manager
+                        .clear_multipart_upload(upload.transfer_id)
+                        .await?;
+                    cleaned = cleaned.saturating_add(1);
+                }
+                Err(error) if is_not_found_provider_error(&error) => {
+                    self.manager
+                        .clear_multipart_upload(upload.transfer_id)
+                        .await?;
+                    cleaned = cleaned.saturating_add(1);
+                }
+                Err(error) => {
+                    tracing::warn!(transfer_id = %upload.transfer_id, error = %safe_provider_error(&error), "unable to abort orphaned multipart upload; retaining checkpoint");
+                }
+            }
+        }
+        Ok(cleaned)
     }
 
     async fn run(&self, id: Uuid, request: StartTransferRequest) {
@@ -750,7 +871,7 @@ impl TransferService {
             if request.collision_policy == CollisionPolicy::Rename {
                 destination = unique_local_destination(&destination)?;
             } else {
-                return Err(AppError::Validation(
+                return Err(AppError::DestinationExists(
                     "destination already exists".to_string(),
                 ));
             }
@@ -2132,14 +2253,14 @@ impl TransferService {
                     });
                 }
             }
-            token = page.next_continuation_token().map(ToString::to_string);
-            if token.is_none() {
-                break;
-            }
-            if objects.len() > 100_000 {
+            if objects.len() > crate::transfer::recursive::MAX_RECURSIVE_ITEMS {
                 return Err(AppError::Validation(
                     "recursive transfer contains more than 100000 items".to_string(),
                 ));
+            }
+            token = page.next_continuation_token().map(ToString::to_string);
+            if token.is_none() {
+                break;
             }
         }
         Ok(objects)
@@ -2192,6 +2313,7 @@ impl TransferService {
             }
         });
         let result = execute_recursive(&plan, &executor, &cancellation, Some(sender)).await;
+        let processed_item_ids = result.processed_item_ids.iter().collect::<HashSet<_>>();
         cancellation_monitor.abort();
         let _ = progress_task.await;
         for item in &plan.items {
@@ -2210,6 +2332,11 @@ impl TransferService {
                     Some(&failure.error),
                     failure.cleanup_required,
                 ),
+                None if result.status == TransferStatus::Cancelled
+                    && !processed_item_ids.contains(&item.id) =>
+                {
+                    (TransferStatus::Cancelled, 0, None, false)
+                }
                 None if item.collision == crate::transfer::recursive::CollisionResolution::Skip => {
                     (TransferStatus::Completed, 0, None, false)
                 }
@@ -3220,9 +3347,12 @@ async fn ensure_collision(
         CollisionPolicy::Skip => Err(AppError::TransferStateConflict(
             "destination skipped".to_string(),
         )),
-        CollisionPolicy::Ask | CollisionPolicy::Fail | CollisionPolicy::Rename => Err(
-            AppError::Validation("destination already exists".to_string()),
-        ),
+        CollisionPolicy::Ask => Err(AppError::DestinationExists(
+            "destination already exists".to_string(),
+        )),
+        CollisionPolicy::Fail | CollisionPolicy::Rename => Err(AppError::Validation(
+            "destination already exists".to_string(),
+        )),
         CollisionPolicy::Replace => Ok(()),
     }
 }
@@ -3449,6 +3579,8 @@ fn safe_provider_error(error: &impl std::fmt::Display) -> String {
 fn is_not_found_provider_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("nosuchkey")
+        || message.contains("nosuchupload")
+        || message.contains("no such upload")
         || message.contains("notfound")
         || message.contains("not found")
         || message.contains("status code: 404")

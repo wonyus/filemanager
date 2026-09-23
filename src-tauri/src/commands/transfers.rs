@@ -5,8 +5,8 @@ use crate::{
     app_state::AppState,
     domain::error::PublicError,
     dto::transfer::{
-        ClearTransferHistoryRequest, ListTransfersRequest, StartTransferRequest, TransferDetails,
-        TransferHistoryPage, TransferJob,
+        ClearTransferHistoryRequest, CollisionPolicy, ListTransfersRequest, StartTransferRequest,
+        TransferDetails, TransferHistoryPage, TransferJob,
     },
 };
 
@@ -75,6 +75,20 @@ pub async fn retry_transfer(
 ) -> Result<TransferJob, PublicError> {
     let id = parse_id(&transfer_id)?;
     state.transfer_service.retry(id).await.map_err(Into::into)
+}
+
+#[command]
+pub async fn resolve_transfer_collision(
+    state: State<'_, AppState>,
+    transfer_id: String,
+    collision_policy: CollisionPolicy,
+) -> Result<TransferJob, PublicError> {
+    let id = parse_id(&transfer_id)?;
+    state
+        .transfer_service
+        .resolve_collision(id, collision_policy)
+        .await
+        .map_err(Into::into)
 }
 
 #[command]

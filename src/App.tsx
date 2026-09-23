@@ -256,6 +256,7 @@ function App() {
     resumeTransfer,
     cancelTransfer,
     retryTransfer,
+    resolveTransferCollision,
     clearTransferHistory,
   } = useAppStore();
   const [editorOpen, setEditorOpen] = useState(false);
@@ -1066,12 +1067,13 @@ function App() {
               }
               transfers={transfers}
               loading={transferLoading}
-              onRefresh={() => void refreshTransfers()}
+              onRefresh={(offset) => void refreshTransfers(offset)}
               onStart={startTransfer}
               onPause={pauseTransfer}
               onResume={resumeTransfer}
               onCancel={cancelTransfer}
               onRetry={retryTransfer}
+              onResolveCollision={resolveTransferCollision}
               onClear={clearTransferHistory}
             />
           )}
@@ -1097,13 +1099,15 @@ function App() {
                 settings={settings}
                 onSaved={bootstrap}
               />
-              <DiagnosticsPanel
-                id="diagnostics"
-                automaticUpdateCheck={settings?.automaticUpdateCheck ?? true}
-                hasActiveTransfers={hasActiveTransfers}
-              />
             </>
           )}
+
+          <DiagnosticsPanel
+            id="diagnostics"
+            visible={activeSection === "settings"}
+            automaticUpdateCheck={settings?.automaticUpdateCheck ?? true}
+            hasActiveTransfers={hasActiveTransfers}
+          />
 
           <footer className="mt-auto flex flex-wrap items-center justify-between gap-2 px-1 pt-4 text-xs text-muted">
             <span>
@@ -3035,6 +3039,7 @@ function TransfersPanel({
   onResume,
   onCancel,
   onRetry,
+  onResolveCollision,
   onClear,
 }: {
   id: string;
@@ -3048,6 +3053,7 @@ function TransfersPanel({
   onResume: (id: string) => Promise<void>;
   onCancel: (id: string) => Promise<void>;
   onRetry: (id: string) => Promise<void>;
+  onResolveCollision: (id: string, policy: CollisionPolicy) => Promise<void>;
   onClear: () => Promise<void>;
 }) {
   const [operation, setOperation] = useState<TransferOperation>("uploadFile");
@@ -3418,26 +3424,64 @@ function TransfersPanel({
           Select a profile before creating a transfer.
         </p>
       ) : transfers?.items.length ? (
-        <div className="mt-4 divide-y divide-border rounded-2xl border border-border">
-          {transfers.items.map((job) => (
-            <TransferRow
-              key={job.id}
-              job={job}
-              destinationPath={destinationByJob[job.id]}
-              onPause={onPause}
-              onResume={onResume}
-              onCancel={onCancel}
-              onRetry={onRetry}
-              onOpenDestination={async (path) => {
-                try {
-                  await commands.openDestinationFolder(path);
-                } catch (error) {
-                  setFormError(formatCommandError(error));
-                }
-              }}
-            />
-          ))}
-        </div>
+        <>
+          <div className="mt-4 divide-y divide-border rounded-2xl border border-border">
+            {transfers.items.map((job) => (
+              <TransferRow
+                key={job.id}
+                job={job}
+                destinationPath={destinationByJob[job.id]}
+                onPause={onPause}
+                onResume={onResume}
+                onCancel={onCancel}
+                onRetry={onRetry}
+                onResolveCollision={onResolveCollision}
+                onOpenDestination={async (path) => {
+                  try {
+                    await commands.openDestinationFolder(path);
+                  } catch (error) {
+                    setFormError(formatCommandError(error));
+                  }
+                }}
+              />
+            ))}
+          </div>
+          {transfers.total > transfers.limit && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+              <span>
+                Showing {transfers.offset + 1}–
+                {Math.min(
+                  transfers.offset + transfers.items.length,
+                  transfers.total,
+                )}{" "}
+                of {transfers.total}
+              </span>
+              <span className="flex gap-2">
+                <button
+                  className="rounded-lg border border-border px-2 py-1 disabled:opacity-50"
+                  type="button"
+                  disabled={transfers.offset === 0 || loading}
+                  onClick={() =>
+                    onRefresh(Math.max(0, transfers.offset - transfers.limit))
+                  }
+                >
+                  Previous
+                </button>
+                <button
+                  className="rounded-lg border border-border px-2 py-1 disabled:opacity-50"
+                  type="button"
+                  disabled={
+                    transfers.offset + transfers.items.length >=
+                      transfers.total || loading
+                  }
+                  onClick={() => onRefresh(transfers.offset + transfers.limit)}
+                >
+                  Next
+                </button>
+              </span>
+            </div>
+          )}
+        </>
       ) : (
         <p className="mt-4 rounded-2xl border border-dashed border-border p-6 text-center text-sm text-muted">
           No transfer jobs yet.
@@ -3454,6 +3498,7 @@ function TransferRow({
   onResume,
   onCancel,
   onRetry,
+  onResolveCollision,
   onOpenDestination,
 }: {
   job: TransferHistoryPage["items"][number];
@@ -3462,6 +3507,7 @@ function TransferRow({
   onResume: (id: string) => Promise<void>;
   onCancel: (id: string) => Promise<void>;
   onRetry: (id: string) => Promise<void>;
+  onResolveCollision: (id: string, policy: CollisionPolicy) => Promise<void>;
   onOpenDestination: (path: string) => Promise<void>;
 }) {
   const [details, setDetails] = useState<TransferDetails | null>(null);
@@ -3490,6 +3536,9 @@ function TransferRow({
       setDetailsLoading(false);
     }
   };
+  const collisionNeedsResolution =
+    details?.job.error?.code === "DESTINATION_EXISTS" ||
+    details?.items.some((item) => item.error?.code === "DESTINATION_EXISTS");
   return (
     <div className="px-4 py-3 text-sm">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -3579,6 +3628,21 @@ function TransferRow({
       {details && (
         <div className="mt-3 rounded-xl border border-border bg-canvas p-3 text-xs">
           <p className="font-semibold">Item results · {details.items.length}</p>
+          {collisionNeedsResolution && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-2 text-amber-900">
+              <span>Destination already exists. Choose how to continue:</span>
+              {(["replace", "skip", "fail"] as const).map((policy) => (
+                <button
+                  className="rounded-md border border-amber-300 bg-white px-1.5 py-0.5 text-[11px]"
+                  key={policy}
+                  type="button"
+                  onClick={() => void onResolveCollision(job.id, policy)}
+                >
+                  {policy[0].toUpperCase() + policy.slice(1)}
+                </button>
+              ))}
+            </div>
+          )}
           {details.items.length === 0 ? (
             <p className="mt-1 text-muted">
               No item-level records for this job.
@@ -3594,7 +3658,28 @@ function TransferRow({
                     {item.id} · {item.status}
                   </span>
                   {item.error && (
-                    <span className="text-red-700">{item.error.message}</span>
+                    <div className="flex flex-wrap items-center justify-end gap-2 text-right">
+                      <span className="text-red-700">{item.error.message}</span>
+                      {item.error.code === "DESTINATION_EXISTS" &&
+                        details.job.status === "completedWithWarnings" && (
+                          <span className="flex gap-1">
+                            {(["replace", "skip", "fail"] as const).map(
+                              (policy) => (
+                                <button
+                                  className="rounded-md border border-border px-1.5 py-0.5 text-[11px] hover:bg-panel"
+                                  key={policy}
+                                  type="button"
+                                  onClick={() =>
+                                    void onResolveCollision(job.id, policy)
+                                  }
+                                >
+                                  {policy[0].toUpperCase() + policy.slice(1)}
+                                </button>
+                              ),
+                            )}
+                          </span>
+                        )}
+                    </div>
                   )}
                 </div>
               ))}
@@ -4012,10 +4097,12 @@ function SettingsPanel({
 
 function DiagnosticsPanel({
   id,
+  visible,
   automaticUpdateCheck,
   hasActiveTransfers,
 }: {
   id: string;
+  visible: boolean;
   automaticUpdateCheck: boolean;
   hasActiveTransfers: boolean;
 }) {
@@ -4092,12 +4179,14 @@ function DiagnosticsPanel({
         last = 0;
       }
       if (Number.isFinite(last) && Date.now() - last < intervalMs) return;
-      try {
-        localStorage.setItem(key, String(Date.now()));
-      } catch {
-        // The check still runs when local persistence is unavailable.
-      }
-      void checkForUpdates();
+      void checkForUpdates().then((result) => {
+        if (!result) return;
+        try {
+          localStorage.setItem(key, String(Date.now()));
+        } catch {
+          // The check still runs when local persistence is unavailable.
+        }
+      });
     };
     runIfDue();
     const timer = window.setInterval(runIfDue, intervalMs);
@@ -4145,7 +4234,7 @@ function DiagnosticsPanel({
   return (
     <section
       id={id}
-      className="rounded-3xl border border-border bg-panel p-5 shadow-soft"
+      className={`${visible ? "" : "hidden "}rounded-3xl border border-border bg-panel p-5 shadow-soft`}
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div>

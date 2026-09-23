@@ -3,6 +3,7 @@ import { commands, formatCommandError } from "../lib/commands";
 import type {
   AppInfo,
   BucketSummary,
+  CollisionPolicy,
   ConnectionTestResult,
   ExplorerLocation,
   ListEntriesPage,
@@ -202,12 +203,16 @@ interface AppStore {
   clearInspector: () => void;
   clearListingError: () => void;
   clearBucketError: () => void;
-  refreshTransfers: () => Promise<TransferHistoryPage | null>;
+  refreshTransfers: (offset?: number) => Promise<TransferHistoryPage | null>;
   startTransfer: (request: StartTransferRequest) => Promise<TransferJob | null>;
   pauseTransfer: (id: string) => Promise<void>;
   resumeTransfer: (id: string) => Promise<void>;
   cancelTransfer: (id: string) => Promise<void>;
   retryTransfer: (id: string) => Promise<void>;
+  resolveTransferCollision: (
+    id: string,
+    policy: CollisionPolicy,
+  ) => Promise<void>;
   clearTransferHistory: () => Promise<void>;
   clearError: () => void;
 }
@@ -551,10 +556,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   clearBucketError: () => set({ bucketError: null }),
 
-  refreshTransfers: async () => {
+  refreshTransfers: async (offset = get().transfers?.offset ?? 0) => {
     set({ transferLoading: true, error: null });
     try {
-      const transfers = await commands.listTransfers(true);
+      const transfers = await commands.listTransfers(true, offset);
       set({ transfers, transferLoading: false });
       return transfers;
     } catch (error) {
@@ -567,8 +572,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ transferLoading: true, error: null });
     try {
       const job = await commands.startTransfer(request);
-      const transfers = await commands.listTransfers(true);
-      set({ transfers, transferLoading: false });
+      try {
+        const transfers = await commands.listTransfers(
+          true,
+          get().transfers?.offset ?? 0,
+        );
+        set({ transfers, transferLoading: false });
+      } catch (refreshError) {
+        // The backend has already accepted the job. Keep the returned id so
+        // the caller cannot accidentally create a duplicate when a history
+        // refresh is temporarily unavailable.
+        set({
+          transferLoading: false,
+          error: `Transfer started, but refreshing transfer history failed: ${formatCommandError(refreshError)}`,
+        });
+      }
       return job;
     } catch (error) {
       set({ transferLoading: false, error: formatCommandError(error) });
@@ -582,6 +600,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
   cancelTransfer: async (id) =>
     transferAction(commands.cancelTransfer, id, set),
   retryTransfer: async (id) => transferAction(commands.retryTransfer, id, set),
+  resolveTransferCollision: async (id, policy) =>
+    transferAction(
+      (transferId) => commands.resolveTransferCollision(transferId, policy),
+      id,
+      set,
+    ),
 
   clearTransferHistory: async () => {
     set({ transferLoading: true, error: null });

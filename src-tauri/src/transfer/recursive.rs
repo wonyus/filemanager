@@ -849,6 +849,10 @@ pub struct RecursiveExecutionResult {
     pub cleanup_required_items: u64,
     pub transferred_bytes: u64,
     pub failures: Vec<RecursiveFailure>,
+    /// Item ids that reached an execution decision before cancellation. Items
+    /// after a cancellation checkpoint must remain cancelled, not be
+    /// reported as completed merely because the plan was created.
+    pub processed_item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -979,11 +983,13 @@ pub async fn execute_recursive<E: RecursiveExecutor>(
     let mut cleanup_required_items = 0_u64;
     let mut transferred_bytes = 0_u64;
     let mut failures = Vec::new();
+    let mut processed_item_ids = Vec::new();
 
     for item in &plan.items {
         if cancellation.is_cancelled() {
             break;
         }
+        processed_item_ids.push(item.id.clone());
         if item.collision == CollisionResolution::Skip {
             skipped_items += 1;
             emit_progress(
@@ -1002,7 +1008,7 @@ pub async fn execute_recursive<E: RecursiveExecutor>(
             failed_items += 1;
             failures.push(failure(
                 item,
-                AppError::Validation(
+                AppError::DestinationExists(
                     "destination collision requires user confirmation".to_string(),
                 ),
                 false,
@@ -1064,6 +1070,7 @@ pub async fn execute_recursive<E: RecursiveExecutor>(
         cleanup_required_items,
         transferred_bytes,
         failures,
+        processed_item_ids,
     }
 }
 

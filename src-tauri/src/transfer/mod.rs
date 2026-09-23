@@ -23,7 +23,7 @@ use crate::{
         TransferItem, TransferJob, TransferOperation, TransferProgress, TransferResult,
         TransferStatus, TransferSummary, UploadMetadata, DTO_SCHEMA_VERSION,
     },
-    infrastructure::database::Database,
+    infrastructure::database::{Database, MultipartUploadRecord},
 };
 
 use self::retry::RetryPolicy;
@@ -167,6 +167,13 @@ impl TransferManager {
             database.clear_multipart_upload(transfer_id).await?;
         }
         Ok(())
+    }
+
+    pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadRecord>, AppError> {
+        match self.database.as_ref() {
+            Some(database) => database.list_multipart_uploads().await,
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Recover durable jobs after opening the app.  Active jobs are first
@@ -483,6 +490,16 @@ impl TransferManager {
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
+        let protected_ids = self
+            .list_multipart_uploads()
+            .await?
+            .into_iter()
+            .map(|upload| upload.transfer_id)
+            .collect::<std::collections::HashSet<_>>();
+        let ids = ids
+            .into_iter()
+            .filter(|id| !protected_ids.contains(id))
+            .collect::<Vec<_>>();
         if let Some(database) = self.database.as_ref() {
             database.delete_transfers(&ids).await?;
         }
@@ -511,6 +528,39 @@ impl TransferManager {
                 "only finished transfers can be retried".to_string(),
             ));
         }
+        self.retry_with_request_and_count(request, old_retry_count)
+            .await
+    }
+
+    /// Clone a terminal transfer with an explicitly adjusted request. This is
+    /// used by collision resolution so the renderer cannot mutate a running
+    /// job in place or bypass the normal queue/state-machine path.
+    pub async fn retry_with_request(
+        &self,
+        id: Uuid,
+        request: StartTransferRequest,
+    ) -> Result<TransferJob, AppError> {
+        let (old_retry_count, status) = {
+            let jobs = self.jobs.read().await;
+            let runtime = jobs
+                .get(&id)
+                .ok_or_else(|| AppError::Unknown(format!("transfer not found: {id}")))?;
+            (runtime.job.retry_count, runtime.job.status)
+        };
+        if !status.is_terminal() {
+            return Err(AppError::Validation(
+                "only finished transfers can be retried".to_string(),
+            ));
+        }
+        self.retry_with_request_and_count(request, old_retry_count)
+            .await
+    }
+
+    async fn retry_with_request_and_count(
+        &self,
+        request: StartTransferRequest,
+        old_retry_count: u32,
+    ) -> Result<TransferJob, AppError> {
         let mut next = self.create(request.clone()).await?;
         let (next_job, next_request) = {
             let mut jobs = self.jobs.write().await;

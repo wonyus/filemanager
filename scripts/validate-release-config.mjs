@@ -113,6 +113,20 @@ export function validateReleaseConfig({
   }
   const certificatePath = value("WINDOWS_SIGNING_CERTIFICATE_PATH");
   const certificatePassword = value("WINDOWS_SIGNING_CERTIFICATE_PASSWORD");
+  const certificateBase64 = value("WINDOWS_CERTIFICATE");
+  const certificateBase64Password = value("WINDOWS_CERTIFICATE_PASSWORD");
+  const hasBase64Certificate = Boolean(certificateBase64);
+  const hasBase64Pair =
+    hasBase64Certificate && Boolean(certificateBase64Password);
+  const hasPathPair = Boolean(certificatePath) && Boolean(certificatePassword);
+  if (
+    (certificateBase64 && !certificateBase64Password) ||
+    (!certificateBase64 && certificateBase64Password)
+  ) {
+    errors.push(
+      "WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD must be provided together",
+    );
+  }
   if (
     (certificatePath && !certificatePassword) ||
     (!certificatePath && certificatePassword)
@@ -123,6 +137,10 @@ export function validateReleaseConfig({
   }
   if (certificatePath && PLACEHOLDER_PATTERN.test(certificatePath))
     errors.push("WINDOWS_SIGNING_CERTIFICATE_PATH contains a placeholder");
+  if (strict && !allowUnsignedWindows && !hasBase64Pair && !hasPathPair)
+    errors.push(
+      "a Windows certificate pair is required: WINDOWS_CERTIFICATE + WINDOWS_CERTIFICATE_PASSWORD or WINDOWS_SIGNING_CERTIFICATE_PATH + WINDOWS_SIGNING_CERTIFICATE_PASSWORD",
+    );
   const timestampUrl = validateHttpsUrl(errors, "WINDOWS_TIMESTAMP_URL");
 
   const artifactUrl = validateHttpsUrl(
@@ -156,6 +174,8 @@ export function validateReleaseConfig({
     signingKey,
     certificateThumbprint,
     certificatePath,
+    certificateBase64,
+    certificateBase64,
     artifactUrl,
     artifactBaseUrl,
     signature,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AppErrorCode {
     ValidationFailed,
@@ -53,6 +53,8 @@ pub enum AppError {
     ProfileNotFound(String),
     #[error("provider operation failed: {0}")]
     Provider(String),
+    #[error("destination already exists: {0}")]
+    DestinationExists(String),
     #[error("unsupported provider feature: {0}")]
     UnsupportedProviderFeature(String),
     #[error("invalid endpoint")]
@@ -144,6 +146,7 @@ impl From<AppError> for PublicError {
             // them in structured details makes failures actionable without
             // exposing raw SDK errors.
             AppError::CredentialMissing(reason)
+            | AppError::DestinationExists(reason)
             | AppError::UnsupportedProviderFeature(reason)
             | AppError::TransferStateConflict(reason) => safe_reason(reason),
             AppError::Provider(reason) => safe_provider_reason(reason),
@@ -182,6 +185,11 @@ impl From<AppError> for PublicError {
                 AppErrorCode::ProviderUnavailable,
                 true,
                 "The provider operation could not be completed.".to_string(),
+            ),
+            AppError::DestinationExists(_) => (
+                AppErrorCode::DestinationExists,
+                false,
+                "The destination already exists; choose a collision policy.".to_string(),
             ),
             AppError::UnsupportedProviderFeature(_) => (
                 AppErrorCode::UnsupportedProviderFeature,

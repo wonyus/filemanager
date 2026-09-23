@@ -21,6 +21,8 @@ function setProtectedBuildEnv() {
     TAURI_UPDATER_PUBLIC_KEY: "protected-public-key",
     TAURI_SIGNING_PRIVATE_KEY: "protected-signing-key",
     WINDOWS_CERTIFICATE_THUMBPRINT: "0123456789abcdef0123456789abcdef01234567",
+    WINDOWS_CERTIFICATE: "protected-certificate-payload",
+    WINDOWS_CERTIFICATE_PASSWORD: "protected-certificate-password",
   });
 }
 
@@ -92,5 +94,20 @@ describe("release configuration validation", () => {
     });
     expect(unsignedResult.errors).toEqual([]);
     expect(unsignedResult.certificateThumbprint).toBeUndefined();
+  });
+
+  it("requires a usable Windows certificate payload in protected mode", () => {
+    setProtectedBuildEnv();
+    delete process.env.WINDOWS_CERTIFICATE;
+    delete process.env.WINDOWS_CERTIFICATE_PASSWORD;
+    delete process.env.WINDOWS_SIGNING_CERTIFICATE_PATH;
+    delete process.env.WINDOWS_SIGNING_CERTIFICATE_PASSWORD;
+    const result = validateReleaseConfig({
+      strict: true,
+      requireManifest: false,
+    });
+    expect(result.errors.join("\n")).toContain(
+      "a Windows certificate pair is required",
+    );
   });
 });

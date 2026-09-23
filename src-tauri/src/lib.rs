@@ -9,8 +9,9 @@ pub mod transfer;
 use std::fs;
 
 use app_state::AppState;
-use infrastructure::database::Database;
+use infrastructure::{database::Database, logging::DiagnosticsLayer};
 use tauri::{Emitter, Manager, WindowEvent};
+use tracing_subscriber::prelude::*;
 
 pub fn run() {
     tauri::Builder::default()
@@ -27,9 +28,37 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(error.to_string()))?
                 .unwrap_or_default();
             let state = AppState::new_with_settings_and_data_dir(database, settings, app_data_dir);
+            let diagnostics = state.diagnostics.clone();
+            let transfer_service = state.transfer_service.clone();
+            let _ = tracing_subscriber::registry()
+                .with(DiagnosticsLayer::new(diagnostics.clone()))
+                .try_init();
             tauri::async_runtime::block_on(state.transfers.recover_from_database())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+            tauri::async_runtime::spawn(async move {
+                match transfer_service.cleanup_orphaned_multipart_uploads().await {
+                    Ok(cleaned) if cleaned > 0 => {
+                        diagnostics
+                            .record(
+                                "INFO",
+                                "multipart-cleanup",
+                                &format!("aborted {cleaned} orphaned multipart upload(s)"),
+                            )
+                            .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        diagnostics
+                            .record(
+                                "WARN",
+                                "multipart-cleanup",
+                                &format!("multipart cleanup failed: {error}"),
+                            )
+                            .await;
+                    }
+                }
+            });
             #[cfg(feature = "updater")]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
@@ -86,6 +115,7 @@ pub fn run() {
             commands::transfers::resume_transfer,
             commands::transfers::cancel_transfer,
             commands::transfers::retry_transfer,
+            commands::transfers::resolve_transfer_collision,
             commands::transfers::clear_transfer_history,
             commands::transfers::interrupt_active_transfers
         ])

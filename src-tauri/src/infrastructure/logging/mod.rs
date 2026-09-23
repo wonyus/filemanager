@@ -1,12 +1,22 @@
 use std::{
     collections::VecDeque,
+    fmt,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use chrono::Utc;
-use tokio::{fs, sync::RwLock};
+use tokio::{
+    fs,
+    sync::{Mutex, RwLock},
+};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::{
+    layer::{Context, Layer},
+    registry::LookupSpan,
+};
+use uuid::Uuid;
 
 use crate::{
     domain::error::AppError,
@@ -21,12 +31,15 @@ use crate::{
 };
 
 const MAX_MEMORY_ENTRIES: usize = 200;
+const DEFAULT_LOG_RETENTION_DAYS: u16 = 14;
+const DEFAULT_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct DiagnosticsService {
     data_dir: Arc<PathBuf>,
     log_file: Arc<PathBuf>,
     entries: Arc<RwLock<VecDeque<DiagnosticLogEntry>>>,
+    export_lock: Arc<Mutex<()>>,
 }
 
 impl DiagnosticsService {
@@ -39,6 +52,7 @@ impl DiagnosticsService {
             data_dir: Arc::new(data_dir),
             log_file: Arc::new(log_file),
             entries: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_MEMORY_ENTRIES))),
+            export_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -76,6 +90,15 @@ impl DiagnosticsService {
             use tokio::io::AsyncWriteExt;
             let _ = file.write_all(format!("{line}\n").as_bytes()).await;
         }
+        if fs::metadata(self.log_file.as_ref())
+            .await
+            .map(|metadata| metadata.len() > DEFAULT_LOG_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = self
+                .prune_log_file(DEFAULT_LOG_RETENTION_DAYS, DEFAULT_LOG_MAX_BYTES)
+                .await;
+        }
     }
 
     pub async fn recent_entries(&self) -> Vec<DiagnosticLogEntry> {
@@ -111,6 +134,7 @@ impl DiagnosticsService {
         settings: SettingsSnapshot,
         profiles: Vec<ProfileSummary>,
     ) -> Result<DiagnosticsExportResult, AppError> {
+        let _export_guard = self.export_lock.lock().await;
         if request.schema_version != DTO_SCHEMA_VERSION {
             return Err(AppError::Validation(
                 "unsupported diagnostics schema version".to_string(),
@@ -121,7 +145,9 @@ impl DiagnosticsService {
             .await?;
         let snapshot = DiagnosticsSnapshot {
             schema_version: DTO_SCHEMA_VERSION,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: option_env!("S3FM_RELEASE_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string(),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             database_schema_version: 6,
@@ -144,7 +170,7 @@ impl DiagnosticsService {
         // Diagnostics are an archive by contract.  Keep the payload as a
         // single redacted JSON member so support tooling can inspect it
         // without ever receiving raw logs, secrets, or presigned URLs.
-        let temporary = destination.with_extension("tmp");
+        let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
         let temporary_for_zip = temporary.clone();
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let file = std::fs::File::create(&temporary_for_zip).map_err(AppError::Io)?;
@@ -197,21 +223,90 @@ impl DiagnosticsService {
                 kept.push_back(line.to_vec());
             }
         }
-        let mut output = Vec::new();
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0usize;
         for line in kept.into_iter().rev() {
-            if output.len().saturating_add(line.len() + 1) > max_bytes as usize {
+            if selected_bytes.saturating_add(line.len() + 1) > max_bytes as usize {
                 break;
             }
+            selected_bytes = selected_bytes.saturating_add(line.len() + 1);
+            selected.push(line);
+        }
+        selected.reverse();
+        let mut output = Vec::with_capacity(selected_bytes);
+        for line in selected {
             output.extend_from_slice(&line);
             output.push(b'\n');
         }
-        output.reverse();
         if output.len() < bytes.len() {
-            let temporary = self.log_file.with_extension("tmp");
+            let temporary = self
+                .log_file
+                .with_extension(format!("tmp-{}", Uuid::new_v4()));
             fs::write(&temporary, output).await?;
             fs::rename(temporary, self.log_file.as_ref()).await?;
         }
         Ok(())
+    }
+}
+
+/// Bridge application tracing calls into the redacted diagnostics store. The
+/// layer schedules asynchronous writes and never blocks provider work on I/O.
+#[derive(Clone)]
+pub struct DiagnosticsLayer {
+    service: Arc<DiagnosticsService>,
+}
+
+impl DiagnosticsLayer {
+    pub fn new(service: Arc<DiagnosticsService>) -> Self {
+        Self { service }
+    }
+}
+
+impl<S> Layer<S> for DiagnosticsLayer
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = EventVisitor::default();
+        event.record(&mut visitor);
+        let message = if visitor.fields.is_empty() {
+            visitor.message
+        } else {
+            format!("{} {}", visitor.message, visitor.fields.join(" "))
+        };
+        let service = self.service.clone();
+        let level = event.metadata().level().to_string();
+        let component = event.metadata().target().to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                service.record(&level, &component, &message).await;
+            });
+        }
+    }
+}
+
+#[derive(Default)]
+struct EventVisitor {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for EventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        let rendered = format!("{}={value:?}", field.name());
+        if field.name() == "message" {
+            self.message = format!("{value:?}").trim_matches('"').to_string();
+        } else {
+            self.fields.push(rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
     }
 }
 

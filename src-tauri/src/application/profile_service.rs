@@ -16,7 +16,7 @@ use crate::{
     domain::{
         error::{is_credential_expired_message, AppError},
         profile::{ConnectionProfile, SecretReference},
-        provider::ProviderType,
+        provider::{CredentialMode, ProviderType},
     },
     dto::{
         explorer::{
@@ -176,7 +176,40 @@ impl ProfileService {
     }
 
     pub async fn list_profiles(&self) -> Result<Vec<ProfileSummary>, AppError> {
-        self.database.list_profiles().await
+        let mut summaries = self.database.list_profiles().await?;
+        for summary in &mut summaries {
+            let Some(profile) = self.database.get_profile(&summary.id).await? else {
+                summary.credential_state = crate::dto::profile::CredentialState::Unavailable;
+                continue;
+            };
+            summary.credential_state = if profile.access_key_id.is_none() {
+                crate::dto::profile::CredentialState::Missing
+            } else if let Some(secret_reference) = profile.secret_reference.as_ref() {
+                match self.credentials.get(secret_reference).await {
+                    Ok(Some(_secret)) => {
+                        if profile.credential_mode == CredentialMode::TemporarySession {
+                            match profile.session_reference.as_ref() {
+                                Some(reference) => match self.credentials.get(reference).await {
+                                    Ok(Some(_token)) => {
+                                        crate::dto::profile::CredentialState::Configured
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        crate::dto::profile::CredentialState::Unavailable
+                                    }
+                                },
+                                None => crate::dto::profile::CredentialState::Unavailable,
+                            }
+                        } else {
+                            crate::dto::profile::CredentialState::Configured
+                        }
+                    }
+                    Ok(None) | Err(_) => crate::dto::profile::CredentialState::Unavailable,
+                }
+            } else {
+                crate::dto::profile::CredentialState::Missing
+            };
+        }
+        Ok(summaries)
     }
 
     pub async fn get_profile(&self, id: &str) -> Result<ProfileDetail, AppError> {
@@ -196,6 +229,7 @@ impl ProfileService {
         &self,
         request: ProfileExportRequest,
     ) -> Result<ProfileExportResult, AppError> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         if request.schema_version != PROFILE_EXPORT_SCHEMA_VERSION {
             return Err(AppError::Validation(
                 "unsupported profile export schema version".to_string(),
@@ -237,7 +271,7 @@ impl ProfileService {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temporary = destination.with_extension("tmp");
+        let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
         fs::write(&temporary, &bytes).await?;
         fs::rename(&temporary, &destination).await?;
         Ok(ProfileExportResult {

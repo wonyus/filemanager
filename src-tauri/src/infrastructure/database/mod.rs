@@ -808,10 +808,17 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let mut count = 0usize;
         for id in ids {
-            let result = sqlx::query("DELETE FROM transfers WHERE id = ?")
-                .bind(id.to_string())
-                .execute(&mut *transaction)
-                .await?;
+            let result = sqlx::query(
+                "DELETE FROM transfers
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM multipart_uploads
+                       WHERE multipart_uploads.transfer_id = transfers.id
+                   )",
+            )
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await?;
             count += result.rows_affected() as usize;
         }
         transaction.commit().await?;
@@ -835,7 +842,11 @@ impl Database {
             "DELETE FROM transfers
              WHERE status IN ('completed', 'completedWithWarnings', 'failed', 'cancelled', 'interrupted')
                AND finished_at IS NOT NULL
-               AND finished_at < ?",
+               AND finished_at < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM multipart_uploads
+                   WHERE multipart_uploads.transfer_id = transfers.id
+               )",
         )
         .bind(cutoff.to_rfc3339())
         .execute(&self.pool)
@@ -849,6 +860,10 @@ impl Database {
                    WHERE status IN ('completed', 'completedWithWarnings', 'failed', 'cancelled', 'interrupted')
                    ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
                    LIMIT ?
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM multipart_uploads
+                   WHERE multipart_uploads.transfer_id = transfers.id
                )",
         )
         .bind(i64::from(max_jobs))

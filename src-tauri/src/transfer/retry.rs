@@ -97,6 +97,7 @@ pub fn classify_error(error: &AppError) -> RetryClass {
         | AppError::Database(_)
         | AppError::DatabaseMigration(_)
         | AppError::CredentialExpired
+        | AppError::DestinationExists(_)
         | AppError::UnsupportedProviderFeature(_)
         | AppError::InvalidEndpoint
         | AppError::InsecureEndpointBlocked
